@@ -1,0 +1,312 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # -------------------------------------------------------------------------
+  # macOS arm64 (Apple Silicon) - signed + notarized
+  # -------------------------------------------------------------------------
+  build-macos-arm64:
+    name: Build macOS arm64
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+
+      - name: Smoke test
+        run: |
+          ./build/img2ans --help
+          python3 - <<'EOF'
+          import struct, zlib
+          def png_chunk(name, data):
+              crc = zlib.crc32(name + data) & 0xFFFFFFFF
+              return struct.pack('>I', len(data)) + name + data + struct.pack('>I', crc)
+          w, h = 64, 64
+          raw = b''
+          for y in range(h):
+              raw += b'\x00'
+              for x in range(w):
+                  raw += bytes([int(x/w*255), int(y/h*255), 80])
+          compressed = zlib.compress(raw)
+          png = (b'\x89PNG\r\n\x1a\n'
+                 + png_chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+                 + png_chunk(b'IDAT', compressed)
+                 + png_chunk(b'IEND', b''))
+          open('/tmp/ci.png', 'wb').write(png)
+          EOF
+          ./build/img2ans --cols 40 --rows 12 /tmp/ci.png /tmp/ci.ans
+          test -f /tmp/ci.ans
+
+      - name: Sign
+        env:
+          APPLE_CERT_P12:      ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_DEVELOPER_ID:  ${{ secrets.APPLE_DEVELOPER_ID }}
+        run: |
+          [ -z "$APPLE_DEVELOPER_ID" ] && echo "No signing identity, skipping." && exit 0
+          KEYCHAIN=$RUNNER_TEMP/build.keychain
+          security create-keychain -p "" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "" "$KEYCHAIN"
+          security default-keychain -s "$KEYCHAIN"
+          echo "$APPLE_CERT_P12" | base64 -d > /tmp/cert.p12
+          security import /tmp/cert.p12 -k "$KEYCHAIN" -f pkcs12 \
+            -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm /tmp/cert.p12
+          codesign --force --sign "$APPLE_DEVELOPER_ID" \
+            --options runtime --timestamp \
+            build/img2ans
+          codesign --verify --verbose build/img2ans
+          echo "Signed successfully"
+
+      - name: Notarize
+        env:
+          APPLE_ID:          ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID:     ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          [ -z "$APPLE_ID" ] && echo "No notarization credentials, skipping." && exit 0
+          ditto -c -k --keepParent build/img2ans /tmp/img2ans-notarize.zip
+          xcrun notarytool submit /tmp/img2ans-notarize.zip \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          echo "Notarized successfully"
+
+      - name: Package
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          mkdir -p pkg
+          cp build/img2ans pkg/
+          cp README.md LICENSE pkg/
+          tar -czf "img2ans-${TAG}-macos-arm64.tar.gz" -C pkg .
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: img2ans-macos-arm64
+          path: img2ans-*-macos-arm64.tar.gz
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------
+  # Linux x86_64 - statically linked via musl
+  # -------------------------------------------------------------------------
+  build-linux:
+    name: Build Linux x86_64 (static)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install musl toolchain
+        run: sudo apt-get install -y musl-tools
+
+      - name: Build (static, musl)
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=musl-gcc \
+            -DCMAKE_EXE_LINKER_FLAGS="-static"
+          cmake --build build
+
+      - name: Verify static linkage
+        run: |
+          file build/img2ans
+          file build/img2ans | grep -q "statically linked"
+
+      - name: Smoke test
+        run: |
+          ./build/img2ans --help
+          python3 - <<'EOF'
+          import struct, zlib
+          def png_chunk(name, data):
+              crc = zlib.crc32(name + data) & 0xFFFFFFFF
+              return struct.pack('>I', len(data)) + name + data + struct.pack('>I', crc)
+          w, h = 64, 64
+          raw = b''
+          for y in range(h):
+              raw += b'\x00'
+              for x in range(w):
+                  raw += bytes([int(x/w*255), int(y/h*255), 80])
+          compressed = zlib.compress(raw)
+          png = (b'\x89PNG\r\n\x1a\n'
+                 + png_chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+                 + png_chunk(b'IDAT', compressed)
+                 + png_chunk(b'IEND', b''))
+          open('/tmp/ci.png', 'wb').write(png)
+          EOF
+          ./build/img2ans --cols 40 --rows 12 /tmp/ci.png /tmp/ci.ans
+          test -f /tmp/ci.ans
+
+      - name: Package
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          mkdir -p pkg
+          cp build/img2ans pkg/
+          cp README.md LICENSE pkg/
+          tar -czf "img2ans-${TAG}-linux-x86_64.tar.gz" -C pkg .
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: img2ans-linux-x86_64
+          path: img2ans-*-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------
+  # Windows x86_64 - cross-compiled with MinGW
+  # -------------------------------------------------------------------------
+  build-windows:
+    name: Build Windows x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install MinGW toolchain
+        run: sudo apt-get install -y mingw-w64
+
+      - name: Build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=Windows \
+            -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
+            -DCMAKE_EXE_LINKER_FLAGS="-static"
+          cmake --build build
+
+      - name: Package
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          mkdir -p pkg
+          cp build/img2ans.exe pkg/
+          cp README.md LICENSE pkg/
+          cd pkg && zip -r "../img2ans-${TAG}-windows-x86_64.zip" .
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: img2ans-windows-x86_64
+          path: img2ans-*-windows-x86_64.zip
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------
+  # Publish GitHub Release + update Homebrew tap
+  # -------------------------------------------------------------------------
+  release:
+    name: Publish release
+    needs:
+      - build-macos-arm64
+      - build-linux
+      - build-windows
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Parse version from tag
+        id: version
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VER="${TAG#v}"
+          echo "tag=${TAG}"     >> "$GITHUB_OUTPUT"
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: List release assets
+        run: ls -lh dist/
+
+      - name: Create source tarball
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          git archive --format=tar.gz --prefix="img2ans-${TAG}/" \
+            -o "dist/img2ans-${TAG}-src.tar.gz" HEAD
+          echo "Source tarball:"
+          ls -lh "dist/img2ans-${TAG}-src.tar.gz"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: img2ans ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          body: |
+            ## img2ans ${{ steps.version.outputs.version }}
+
+            Convert images (PNG, JPEG, BMP) to CP437 ANSI art.
+
+            ### Install via Homebrew
+            ```sh
+            brew tap fewtarius/tap
+            brew install img2ans
+            ```
+
+            ### Download binaries
+            | Platform | Archive |
+            |----------|---------|
+            | macOS (Apple Silicon, signed + notarized) | `img2ans-${{ steps.version.outputs.tag }}-macos-arm64.tar.gz` |
+            | Linux x86_64 (static) | `img2ans-${{ steps.version.outputs.tag }}-linux-x86_64.tar.gz` |
+            | Windows x86_64 | `img2ans-${{ steps.version.outputs.tag }}-windows-x86_64.zip` |
+
+            ### Build from source
+            ```sh
+            cmake -B build -DCMAKE_BUILD_TYPE=Release
+            cmake --build build
+            sudo cmake --install build
+            ```
+          files: dist/*
+          fail_on_unmatched_files: true
+
+      - name: Compute source tarball SHA256
+        id: sha256
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          REPO="${{ github.repository }}"
+          SRC_ASSET="dist/img2ans-${TAG}-src.tar.gz"
+          ASSET_URL="https://github.com/${REPO}/releases/download/${TAG}/img2ans-${TAG}-src.tar.gz"
+          echo "url=${ASSET_URL}" >> "$GITHUB_OUTPUT"
+          SHA256=$(sha256sum "$SRC_ASSET" | awk '{print $1}')
+          echo "sha256=${SHA256}" >> "$GITHUB_OUTPUT"
+          echo "Source tarball SHA256: ${SHA256}"
+
+      - name: Update Homebrew tap
+        env:
+          HOMEBREW_PAT: ${{ secrets.HOMEBREW_PAT }}
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          VER="${{ steps.version.outputs.version }}"
+          URL="${{ steps.sha256.outputs.url }}"
+          SHA="${{ steps.sha256.outputs.sha256 }}"
+
+          git clone "https://x-access-token:${HOMEBREW_PAT}@github.com/fewtarius/homebrew-tap.git" tap-repo
+          cd tap-repo
+
+          sed -i "s|url \".*\"|url \"${URL}\"|"         Formula/img2ans.rb
+          sed -i "s|sha256 \".*\"|sha256 \"${SHA}\"|"   Formula/img2ans.rb
+          sed -i "s|# version:.*|# version: ${VER}|"    Formula/img2ans.rb
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/img2ans.rb
+          git diff --cached --quiet && echo "No formula changes needed" && exit 0
+          git commit -m "img2ans: update to ${TAG}"
+          git push

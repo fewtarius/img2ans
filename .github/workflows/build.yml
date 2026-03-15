@@ -1,0 +1,70 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Smoke test
+        run: |
+          ./build/img2ans --help
+          python3 - <<'EOF'
+          import struct, zlib, os
+
+          def png_chunk(name, data):
+              crc = zlib.crc32(name + data) & 0xFFFFFFFF
+              return struct.pack('>I', len(data)) + name + data + struct.pack('>I', crc)
+
+          w, h = 64, 64
+          raw = b''
+          for y in range(h):
+              raw += b'\x00'
+              for x in range(w):
+                  r = int(x / w * 255)
+                  g = int(y / h * 255)
+                  raw += bytes([r, g, 80])
+          compressed = zlib.compress(raw)
+          png = (b'\x89PNG\r\n\x1a\n'
+                 + png_chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+                 + png_chunk(b'IDAT', compressed)
+                 + png_chunk(b'IEND', b''))
+          with open('/tmp/test_ci.png', 'wb') as f:
+              f.write(png)
+          print(f'Generated test PNG: {len(png)} bytes')
+          EOF
+          ./build/img2ans --cols 40 --rows 12 /tmp/test_ci.png /tmp/test_ci.ans
+          test -f /tmp/test_ci.ans
+          echo "Output size: $(wc -c < /tmp/test_ci.ans) bytes"
+          ./build/img2ans --cols 20 --rows 5 --sauce --title "CI Test" --author "GHA" /tmp/test_ci.png /tmp/test_sauce.ans
+          python3 -c "
+          d = open('/tmp/test_sauce.ans','rb').read()
+          idx = d.rfind(b'SAUCE')
+          assert idx >= 0, 'SAUCE record not found'
+          sauce = d[idx:]
+          cols = int.from_bytes(sauce[96:98], 'little')
+          rows = int.from_bytes(sauce[98:100], 'little')
+          assert cols == 20, f'expected cols=20 got {cols}'
+          assert rows == 5,  f'expected rows=5 got {rows}'
+          print(f'SAUCE OK: {cols}x{rows}')
+          "

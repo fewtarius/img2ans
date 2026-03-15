@@ -1,0 +1,13 @@
+# Build output
+img2ans
+*.o
+*.dSYM/
+build/
+
+# CLIO session files (never commit)
+ai-assisted/
+scratch/
+
+# CLIO (managed automatically)
+.clio/*
+!.clio/instructions.md

@@ -1,0 +1,145 @@
+.TH IMG2ANS 1 "2026-03-14" "img2ans" "User Commands"
+.SH NAME
+img2ans \- convert images to ANSI art
+.SH SYNOPSIS
+.B img2ans
+[\fIoptions\fR] \fIinput\fR [\fIoutput.ans\fR]
+.SH DESCRIPTION
+.B img2ans
+converts PNG, JPEG, or BMP images to CP437 ANSI art files suitable for
+telnet BBSs, ANSI viewers, and terminals.
+.PP
+Images are scaled to fit the requested column width, sampled at 8x16 pixel
+glyph resolution, and each cell is matched to the best combination of
+CP437 block character (space, shades, half-blocks) and 16-color ANSI
+foreground/background attribute.
+.PP
+Output is a raw CP437 byte stream with minimized ANSI SGR escape sequences.
+An optional SAUCE metadata record can be appended.
+.SH OPTIONS
+.TP
+.BI \-\-cols " N"
+Width of the output in character columns.
+Default: 80.
+.TP
+.BI \-\-rows " N"
+Height of the output in character rows.
+Default: auto (preserves the image aspect ratio, assuming square pixels
+and a 2:1 cell aspect ratio).
+.TP
+.BI \-\-palette " NAME"
+Color palette to use for the 16-color quantization.
+.RS
+.TP
+.B vga
+Standard VGA/DOS colors (default).
+.TP
+.B win
+Windows console colors.
+.RE
+.TP
+.B \-\-ice
+Enable iCE colors.
+Allows all 16 colors as background (without blinking).
+By default, only the 8 dark background colors are used.
+.TP
+.BI \-\-dither " MODE"
+Dithering algorithm.
+.RS
+.TP
+.B fs
+Floyd-Steinberg error diffusion (default).
+.TP
+.B atkinson
+Atkinson dithering; retains more detail in highlights.
+.TP
+.B none
+No dithering; fastest, produces harder edges.
+.RE
+.TP
+.BI \-\-metric " MODE"
+Color distance metric used for palette matching.
+.RS
+.TP
+.B rm
+Redmean weighted Euclidean distance (default).
+Good perceptual quality with low computational cost.
+.TP
+.B rgb
+Plain sRGB Euclidean distance.
+Fast but less perceptually accurate.
+.TP
+.B ycbcr
+YCbCr-space distance with saturation-boosted chroma weight.
+Can improve color fidelity for vivid images.
+.RE
+.TP
+.B \-\-sauce
+Append a SAUCE metadata record to the output file.
+.TP
+.BI \-\-title " STR"
+Set the SAUCE title field (implies
+.BR \-\-sauce ).
+Maximum 35 characters.
+.TP
+.BI \-\-author " STR"
+Set the SAUCE author field (implies
+.BR \-\-sauce ).
+Maximum 20 characters.
+.TP
+.BI \-\-group " STR"
+Set the SAUCE group field (implies
+.BR \-\-sauce ).
+Maximum 20 characters.
+.TP
+.BR \-h ", " \-\-help
+Print a usage summary and exit.
+.SH "OUTPUT FORMAT"
+The output file is a raw byte stream containing CP437 characters interleaved
+with ANSI X3.64 SGR escape sequences for color and attribute control.
+Lines are terminated with CR+LF for maximum ANSI viewer compatibility.
+.PP
+When
+.B \-\-sauce
+is given, an EOF marker byte (0x1A) followed by a 128-byte SAUCE record is
+appended after the last line.
+.SH EXAMPLES
+Convert an image to an 80-column ANSI file:
+.PP
+.RS
+img2ans logo.png logo.ans
+.RE
+.PP
+Convert with iCE colors and custom dimensions:
+.PP
+.RS
+img2ans \-\-cols 80 \-\-rows 50 \-\-ice banner.png banner.ans
+.RE
+.PP
+Convert with SAUCE metadata:
+.PP
+.RS
+img2ans \-\-title "My Logo" \-\-author "SysOp" \-\-group "ACiD" logo.png logo.ans
+.RE
+.PP
+Convert with Atkinson dithering and YCbCr color matching:
+.PP
+.RS
+img2ans \-\-dither atkinson \-\-metric ycbcr photo.jpg photo.ans
+.RE
+.SH BUILDING
+Requires a C99 compiler.
+.B stb_image.h
+must be present in the same directory.
+No other external dependencies.
+.PP
+.RS
+make
+.br
+sudo make install
+.RE
+.SH "SEE ALSO"
+.BR convert (1),
+.BR ffmpeg (1)
+.SH LICENSE
+MIT
