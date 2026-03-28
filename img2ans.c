@@ -77,12 +77,24 @@ static inline uint8_t linear_to_srgb(float v) {
  * ---------------------------------------------------------------------- */
 
 typedef struct { uint8_t r, g, b; } RGB;
-typedef struct { uint8_t ch, attr; } Cell; /* attr = (bg<<4)|fg */
+
+/* Cell: glyph + color info. attr used for 16-color mode; fg_idx/bg_idx for 256;
+ * fg_rgb/bg_rgb for 24-bit. All modes populate glyph ch. */
+typedef struct {
+    uint8_t ch;
+    uint8_t attr;     /* 16-color: (bg<<4)|fg */
+    int     fg_idx;   /* 256-color palette index */
+    int     bg_idx;   /* 256-color palette index */
+    RGB     fg_rgb;   /* 24-bit: exact foreground */
+    RGB     bg_rgb;   /* 24-bit: exact background */
+} Cell;
 
 typedef enum { METRIC_RGB, METRIC_REDMEAN, METRIC_YCBCR } ColorMetric;
 typedef enum { DITHER_NONE, DITHER_FS, DITHER_ATKINSON, DITHER_ORDERED, DITHER_JJN } DitherMode;
 typedef enum { PAL_VGA, PAL_WIN } PaletteKind;
 typedef enum { GLYPH_STANDARD, GLYPH_EXTENDED } GlyphSet;
+typedef enum { COLOR_16, COLOR_256, COLOR_24BIT } ColorMode;
+typedef enum { FMT_ANS, FMT_BIN } OutputFormat;
 
 /* Double-buffered floating-point pixel for dithering */
 typedef struct { double r, g, b; } FRGB;
@@ -105,6 +117,8 @@ typedef struct {
     int          gamma_correct; /* linearize before averaging */
     double       sharpen;       /* unsharp mask strength (0 = off) */
     GlyphSet     glyph_set;     /* standard or extended */
+    ColorMode    color_mode;    /* 16, 256, or 24-bit */
+    OutputFormat format;        /* ans or bin */
     /* SAUCE */
     int          sauce;
     char         title[36];
@@ -265,6 +279,26 @@ static const RGB WIN16[16] = {
 
 static inline const RGB *get_palette(PaletteKind pk) {
     return (pk == PAL_WIN) ? WIN16 : VGA16;
+}
+
+/* xterm-256 palette: 16 system + 216 color cube + 24 grayscale */
+static RGB XTERM256[256];
+
+static void init_xterm256(void) {
+    /* 0-15: same as VGA16 */
+    memcpy(XTERM256, VGA16, 16 * sizeof(RGB));
+    /* 16-231: 6x6x6 color cube */
+    for (int i = 0; i < 216; i++) {
+        int r = i / 36, g = (i / 6) % 6, b = i % 6;
+        XTERM256[16+i].r = r ? (uint8_t)(r * 40 + 55) : 0;
+        XTERM256[16+i].g = g ? (uint8_t)(g * 40 + 55) : 0;
+        XTERM256[16+i].b = b ? (uint8_t)(b * 40 + 55) : 0;
+    }
+    /* 232-255: grayscale */
+    for (int i = 0; i < 24; i++) {
+        uint8_t v = (uint8_t)(8 + i * 10);
+        XTERM256[232+i] = (RGB){v, v, v};
+    }
 }
 
 /* -------------------------------------------------------------------------
@@ -511,6 +545,34 @@ static long cell_error(const GlyphInfo *g, int fg_idx, int bg_idx,
     return err;
 }
 
+/* cell_error variant taking direct RGB colors (for 256-color/24-bit modes) */
+static long cell_error_rgb(const GlyphInfo *g, RGB fg, RGB bg,
+                            const RGB samples[16][8], ColorMetric m) {
+    if (g->ch == CP437_LIGHT || g->ch == CP437_MED || g->ch == CP437_DARK) {
+        double cov = (double)g->on_count / 128.0;
+        RGB blend = {
+            (uint8_t)(fg.r * cov + bg.r * (1.0 - cov) + 0.5),
+            (uint8_t)(fg.g * cov + bg.g * (1.0 - cov) + 0.5),
+            (uint8_t)(fg.b * cov + bg.b * (1.0 - cov) + 0.5),
+        };
+        long err = 0;
+        for (int py = 0; py < 16; py++)
+            for (int px = 0; px < 8; px++)
+                err += pal_dist2(samples[py][px], blend, m);
+        return err;
+    }
+
+    long err = 0;
+    for (int py = 0; py < 16; py++) {
+        uint8_t row = g->rows[py];
+        for (int px = 0; px < 8; px++) {
+            int on = (row >> (7 - px)) & 1;
+            err += pal_dist2(samples[py][px], on ? fg : bg, m);
+        }
+    }
+    return err;
+}
+
 /* Compute the average RGB of the 16x8 samples */
 static RGB avg_samples(const RGB samples[16][8]) {
     long sr = 0, sg = 0, sb = 0;
@@ -567,7 +629,141 @@ static Cell best_cell(const RGB samples[16][8], const RGB *pal,
     }
 
     uint8_t attr = (uint8_t)(((best_bg & 0x0F) << 4) | (best_fg & 0x0F));
-    return (Cell){ best_ch, attr };
+    return (Cell){ best_ch, attr, 0, 0, {0,0,0}, {0,0,0} };
+}
+
+/* 256-color best_cell: same exhaustive search but over 256 palette entries.
+ * Uses iCE-style approach (no blink bit concern with 256 colors). */
+static Cell best_cell_256(RGB samples[16][8], const RGB *pal256, ColorMetric m) {
+    long best_err = LONG_MAX;
+    uint8_t best_ch = 0x20;
+    int best_fg = 0, best_bg = 0;
+
+    for (int gi = 0; gi < g_num_glyphs; gi++) {
+        const GlyphInfo *g = &g_glyphs[gi];
+
+        if (g->on_count == 0) {
+            /* Solid BG only */
+            for (int bg = 0; bg < 256; bg++) {
+                long err = 0;
+                for (int py = 0; py < 16 && err < best_err; py++)
+                    for (int px = 0; px < 8; px++)
+                        err += pal_dist2(samples[py][px], pal256[bg], m);
+                if (err < best_err) {
+                    best_err = err; best_ch = g->ch; best_fg = 0; best_bg = bg;
+                }
+            }
+        } else if (g->on_count == 128) {
+            /* Solid FG only */
+            for (int fg = 0; fg < 256; fg++) {
+                long err = 0;
+                for (int py = 0; py < 16 && err < best_err; py++)
+                    for (int px = 0; px < 8; px++)
+                        err += pal_dist2(samples[py][px], pal256[fg], m);
+                if (err < best_err) {
+                    best_err = err; best_ch = g->ch; best_fg = fg; best_bg = 0;
+                }
+            }
+        } else {
+            /* For 256 colors, exhaustive FG*BG (256*256=65536) is too expensive.
+             * Instead: find the 2 best-matching palette entries for the cell avg,
+             * then search a neighborhood around them. */
+            RGB avg = avg_samples(samples);
+            int top[8];
+            long top_d[8];
+            for (int i = 0; i < 8; i++) { top[i] = 0; top_d[i] = LONG_MAX; }
+            for (int ci = 0; ci < 256; ci++) {
+                long d = pal_dist2(avg, pal256[ci], m);
+                for (int i = 0; i < 8; i++) {
+                    if (d < top_d[i]) {
+                        for (int j = 7; j > i; j--) { top[j] = top[j-1]; top_d[j] = top_d[j-1]; }
+                        top[i] = ci; top_d[i] = d;
+                        break;
+                    }
+                }
+            }
+
+            /* Search top-N fg x top-N bg combinations */
+            for (int fi = 0; fi < 8; fi++) {
+                for (int bi = 0; bi < 8; bi++) {
+                    int fg = top[fi], bg = top[bi];
+                    long err = cell_error_rgb(g, pal256[fg], pal256[bg], samples, m);
+                    if (err < best_err) {
+                        best_err = err; best_ch = g->ch; best_fg = fg; best_bg = bg;
+                    }
+                }
+            }
+        }
+    }
+
+    Cell c = {0};
+    c.ch = best_ch;
+    c.fg_idx = best_fg;
+    c.bg_idx = best_bg;
+    c.fg_rgb = pal256[best_fg];
+    c.bg_rgb = pal256[best_bg];
+    return c;
+}
+
+/* 24-bit truecolor best_cell: compute optimal FG/BG analytically per glyph.
+ * For each glyph, FG = avg of "on" pixels, BG = avg of "off" pixels. */
+static Cell best_cell_24bit(RGB samples[16][8], ColorMetric m) {
+    long best_err = LONG_MAX;
+    Cell best = {0};
+    best.ch = 0x20;
+
+    for (int gi = 0; gi < g_num_glyphs; gi++) {
+        const GlyphInfo *g = &g_glyphs[gi];
+        double fg_r = 0, fg_g = 0, fg_b = 0;
+        double bg_r = 0, bg_g = 0, bg_b = 0;
+        int fg_cnt = 0, bg_cnt = 0;
+
+        /* Compute optimal FG (on pixels) and BG (off pixels) as averages */
+        for (int py = 0; py < 16; py++) {
+            uint8_t row = g->rows[py];
+            for (int px = 0; px < 8; px++) {
+                int on = (row >> (7 - px)) & 1;
+                if (on) {
+                    fg_r += samples[py][px].r; fg_g += samples[py][px].g; fg_b += samples[py][px].b;
+                    fg_cnt++;
+                } else {
+                    bg_r += samples[py][px].r; bg_g += samples[py][px].g; bg_b += samples[py][px].b;
+                    bg_cnt++;
+                }
+            }
+        }
+
+        RGB fg_c, bg_c;
+        if (fg_cnt > 0) {
+            fg_c = (RGB){ (uint8_t)(fg_r / fg_cnt + 0.5), (uint8_t)(fg_g / fg_cnt + 0.5), (uint8_t)(fg_b / fg_cnt + 0.5) };
+        } else {
+            fg_c = (RGB){0, 0, 0};
+        }
+        if (bg_cnt > 0) {
+            bg_c = (RGB){ (uint8_t)(bg_r / bg_cnt + 0.5), (uint8_t)(bg_g / bg_cnt + 0.5), (uint8_t)(bg_b / bg_cnt + 0.5) };
+        } else {
+            bg_c = (RGB){0, 0, 0};
+        }
+
+        /* Compute error with optimal colors */
+        long err = 0;
+        for (int py = 0; py < 16; py++) {
+            uint8_t row = g->rows[py];
+            for (int px = 0; px < 8; px++) {
+                int on = (row >> (7 - px)) & 1;
+                err += pal_dist2(samples[py][px], on ? fg_c : bg_c, m);
+            }
+        }
+
+        if (err < best_err) {
+            best_err = err;
+            best.ch = g->ch;
+            best.fg_rgb = fg_c;
+            best.bg_rgb = bg_c;
+        }
+    }
+
+    return best;
 }
 
 /* -------------------------------------------------------------------------
@@ -682,29 +878,48 @@ static Cell *convert_image(const uint8_t *img, int img_w, int img_h,
             }
 
             /* Find best cell */
-            Cell cell = best_cell(samples, pal, opt->ice, opt->metric);
+            Cell cell;
+            if (opt->color_mode == COLOR_256) {
+                cell = best_cell_256(samples, XTERM256, opt->metric);
+            } else if (opt->color_mode == COLOR_24BIT) {
+                cell = best_cell_24bit(samples, opt->metric);
+            } else {
+                cell = best_cell(samples, pal, opt->ice, opt->metric);
+            }
             cells[cy * cols + cx] = cell;
 
             /* Propagate dithering error (error-diffusion modes only) */
             if (opt->dither == DITHER_FS || opt->dither == DITHER_ATKINSON || opt->dither == DITHER_JJN) {
                 /* Compute the approximate RGB that this cell renders */
-                int fg = cell.attr & 0x0F;
-                int bg = (cell.attr >> 4) & 0x0F;
                 const GlyphInfo *g = NULL;
                 for (int gi = 0; gi < g_num_glyphs; gi++) {
                     if (g_glyphs[gi].ch == cell.ch) { g = &g_glyphs[gi]; break; }
                 }
+
+                RGB fg_c, bg_c;
+                if (opt->color_mode == COLOR_24BIT) {
+                    fg_c = cell.fg_rgb;
+                    bg_c = cell.bg_rgb;
+                } else if (opt->color_mode == COLOR_256) {
+                    fg_c = XTERM256[cell.fg_idx];
+                    bg_c = XTERM256[cell.bg_idx];
+                } else {
+                    int fg = cell.attr & 0x0F;
+                    int bg = (cell.attr >> 4) & 0x0F;
+                    fg_c = pal[fg];
+                    bg_c = pal[bg];
+                }
+
                 RGB approx;
                 if (!g || g->on_count == 0) {
-                    approx = pal[bg];
+                    approx = bg_c;
                 } else if (g->on_count == 128) {
-                    approx = pal[fg];
+                    approx = fg_c;
                 } else {
-                    /* Blend: approximate rendered average as weighted avg */
                     double alpha = (double)g->on_count / 128.0;
-                    approx.r = (uint8_t)clamp_byte((int)(alpha * pal[fg].r + (1-alpha) * pal[bg].r + 0.5));
-                    approx.g = (uint8_t)clamp_byte((int)(alpha * pal[fg].g + (1-alpha) * pal[bg].g + 0.5));
-                    approx.b = (uint8_t)clamp_byte((int)(alpha * pal[fg].b + (1-alpha) * pal[bg].b + 0.5));
+                    approx.r = (uint8_t)clamp_byte((int)(alpha * fg_c.r + (1-alpha) * bg_c.r + 0.5));
+                    approx.g = (uint8_t)clamp_byte((int)(alpha * fg_c.g + (1-alpha) * bg_c.g + 0.5));
+                    approx.b = (uint8_t)clamp_byte((int)(alpha * fg_c.b + (1-alpha) * bg_c.b + 0.5));
                 }
                 RGB avg = avg_samples(samples);
                 diffuse_error(cx, cy, avg, approx, opt->dither);
@@ -759,6 +974,75 @@ static void save_ansi(FILE *f, const Cell *cells, int cols, int rows,
     int reset[] = {0};
     emit_sgr(f, reset, 1);
 
+    if (opt->color_mode == COLOR_24BIT) {
+        /* 24-bit truecolor output: ESC[38;2;R;G;Bm / ESC[48;2;R;G;Bm */
+        RGB cur_fg = {0, 0, 0}, cur_bg = {0, 0, 0};
+        int first = 1;
+
+        for (int r = 0; r < rows; r++) {
+            for (int c = 0; c < cols; c++) {
+                const Cell *cell = &cells[r * cols + c];
+                uint8_t ch = cell->ch;
+                if (ch < 32 || ch == 127) ch = 32;
+
+                RGB fg = cell->fg_rgb, bg = cell->bg_rgb;
+                char buf[64];
+                if (first || fg.r != cur_fg.r || fg.g != cur_fg.g || fg.b != cur_fg.b) {
+                    snprintf(buf, sizeof(buf), "\x1B[38;2;%d;%d;%dm", fg.r, fg.g, fg.b);
+                    write_str(f, buf);
+                    cur_fg = fg;
+                }
+                if (first || bg.r != cur_bg.r || bg.g != cur_bg.g || bg.b != cur_bg.b) {
+                    snprintf(buf, sizeof(buf), "\x1B[48;2;%d;%d;%dm", bg.r, bg.g, bg.b);
+                    write_str(f, buf);
+                    cur_bg = bg;
+                }
+                first = 0;
+                write_bytes(f, &ch, 1);
+            }
+            if (r < rows - 1) {
+                write_str(f, "\x1B[0m\r\n");
+                first = 1;
+            }
+        }
+        write_str(f, "\x1B[0m");
+        return;
+    }
+
+    if (opt->color_mode == COLOR_256) {
+        /* 256-color output: ESC[38;5;Nm / ESC[48;5;Nm */
+        int cur_fg = -1, cur_bg = -1;
+
+        for (int r = 0; r < rows; r++) {
+            for (int c = 0; c < cols; c++) {
+                const Cell *cell = &cells[r * cols + c];
+                uint8_t ch = cell->ch;
+                if (ch < 32 || ch == 127) ch = 32;
+
+                int fg = cell->fg_idx, bg = cell->bg_idx;
+                char buf[32];
+                if (fg != cur_fg) {
+                    snprintf(buf, sizeof(buf), "\x1B[38;5;%dm", fg);
+                    write_str(f, buf);
+                    cur_fg = fg;
+                }
+                if (bg != cur_bg) {
+                    snprintf(buf, sizeof(buf), "\x1B[48;5;%dm", bg);
+                    write_str(f, buf);
+                    cur_bg = bg;
+                }
+                write_bytes(f, &ch, 1);
+            }
+            if (r < rows - 1) {
+                write_str(f, "\x1B[0m\r\n");
+                cur_fg = cur_bg = -1;
+            }
+        }
+        write_str(f, "\x1B[0m");
+        return;
+    }
+
+    /* 16-color mode (original) */
     int cur_attr = -1;
 
     for (int r = 0; r < rows; r++) {
@@ -879,6 +1163,19 @@ typedef struct {
 } SauceRecord;
 #pragma pack(pop)
 
+/* BIN format output: raw character+attribute pairs, 16-color only */
+static void save_bin(FILE *f, const Cell *cells, int cols, int rows) {
+    for (int r = 0; r < rows; r++) {
+        for (int c = 0; c < cols; c++) {
+            const Cell *cell = &cells[r * cols + c];
+            uint8_t ch = cell->ch;
+            if (ch < 32 || ch == 127) ch = 32;
+            uint8_t pair[2] = { ch, cell->attr };
+            write_bytes(f, pair, 2);
+        }
+    }
+}
+
 static void write_sauce(FILE *f, int cols, int rows, int ice,
                          long file_size_before, const Options *opt) {
     /* EOF marker */
@@ -908,7 +1205,7 @@ static void write_sauce(FILE *f, int cols, int rows, int ice,
 
     s.file_size    = (uint32_t)file_size_before;
     s.data_type    = 1;  /* Character */
-    s.file_type    = 1;  /* ANSI */
+    s.file_type    = (opt->format == FMT_BIN) ? 5 : 1;  /* 5=BIN, 1=ANSI */
     s.tinfo1       = (uint16_t)cols;
     s.tinfo2       = (uint16_t)rows;
     s.tinfo3       = 0;
@@ -941,6 +1238,8 @@ static void usage(const char *prog) {
         "  --no-gamma     disable gamma correction (default)\n"
         "  --sharpen N    unsharp mask strength (default: off, try 0.5-2.0)\n"
         "  --glyphs SET   glyph set: standard (default) or extended\n"
+        "  --colors MODE  color mode: 16 (default), 256, or 24bit\n"
+        "  --format FMT   output format: ans (default) or bin\n"
         "  --sauce        embed SAUCE metadata record\n"
         "  --title STR    SAUCE title (implies --sauce)\n"
         "  --author STR   SAUCE author (implies --sauce)\n"
@@ -968,6 +1267,8 @@ int main(int argc, char *argv[]) {
     opt.gamma_correct = 0;
     opt.sharpen = 0.0;
     opt.glyph_set = GLYPH_STANDARD;
+    opt.color_mode = COLOR_16;
+    opt.format = FMT_ANS;
 
     const char *in_file  = NULL;
     const char *out_file = NULL;
@@ -1000,6 +1301,17 @@ int main(int argc, char *argv[]) {
             if (strcmp(argv[i], "standard") == 0)      opt.glyph_set = GLYPH_STANDARD;
             else if (strcmp(argv[i], "extended") == 0)  opt.glyph_set = GLYPH_EXTENDED;
             else die("unknown glyph set (standard|extended)");
+        } else if (strcmp(argv[i], "--colors") == 0 && i+1 < argc) {
+            i++;
+            if (strcmp(argv[i], "16") == 0)        opt.color_mode = COLOR_16;
+            else if (strcmp(argv[i], "256") == 0)  opt.color_mode = COLOR_256;
+            else if (strcmp(argv[i], "24bit") == 0) opt.color_mode = COLOR_24BIT;
+            else die("unknown color mode (16|256|24bit)");
+        } else if (strcmp(argv[i], "--format") == 0 && i+1 < argc) {
+            i++;
+            if (strcmp(argv[i], "ans") == 0)       opt.format = FMT_ANS;
+            else if (strcmp(argv[i], "bin") == 0)  opt.format = FMT_BIN;
+            else die("unknown format (ans|bin)");
         } else if (strcmp(argv[i], "--dither") == 0 && i+1 < argc) {
             i++;
             if (strcmp(argv[i], "none") == 0)         opt.dither = DITHER_NONE;
@@ -1040,14 +1352,15 @@ int main(int argc, char *argv[]) {
 
     if (!in_file) { usage(argv[0]); return 1; }
 
-    /* Build default output name: replace/append .ans */
+    /* Build default output name: replace/append extension */
     static char out_buf[4096];
+    const char *ext = (opt.format == FMT_BIN) ? ".bin" : ".ans";
     if (!out_file) {
         strncpy(out_buf, in_file, sizeof(out_buf) - 5);
         char *dot = strrchr(out_buf, '.');
         char *slash = strrchr(out_buf, '/');
         if (dot && (!slash || dot > slash)) *dot = '\0';
-        strncat(out_buf, ".ans", sizeof(out_buf) - strlen(out_buf) - 1);
+        strncat(out_buf, ext, sizeof(out_buf) - strlen(out_buf) - 1);
         out_file = out_buf;
     }
 
@@ -1065,6 +1378,8 @@ int main(int argc, char *argv[]) {
     init_glyphs(opt.glyph_set);
     if (opt.gamma_correct)
         init_gamma_tables();
+    if (opt.color_mode == COLOR_256)
+        init_xterm256();
 
     /* Pre-process: sharpen if requested */
     uint8_t *sharp_img = NULL;
@@ -1083,11 +1398,20 @@ int main(int argc, char *argv[]) {
 
     fprintf(stderr, "img2ans: rendering %dx%d cells -> '%s'\n", out_cols, out_rows, out_file);
 
+    /* Validate format/mode combos */
+    if (opt.format == FMT_BIN && opt.color_mode != COLOR_16) {
+        die("BIN format only supports 16-color mode");
+    }
+
     /* Write output */
     FILE *f = fopen(out_file, "wb");
     if (!f) { fprintf(stderr, "img2ans: cannot open '%s' for writing\n", out_file); return 1; }
 
-    save_ansi(f, cells, out_cols, out_rows, opt.ice, &opt);
+    if (opt.format == FMT_BIN) {
+        save_bin(f, cells, out_cols, out_rows);
+    } else {
+        save_ansi(f, cells, out_cols, out_rows, opt.ice, &opt);
+    }
 
     long file_size = ftell(f);
 
