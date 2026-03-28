@@ -21,6 +21,12 @@
 #include <stdint.h>
 #include <time.h>
 
+/* Fatal error + exit */
+static void die(const char *msg) {
+    fprintf(stderr, "img2ans: %s\n", msg);
+    exit(1);
+}
+
 /* -------------------------------------------------------------------------
  * Constants
  * ---------------------------------------------------------------------- */
@@ -95,6 +101,7 @@ typedef enum { PAL_VGA, PAL_WIN } PaletteKind;
 typedef enum { GLYPH_STANDARD, GLYPH_EXTENDED } GlyphSet;
 typedef enum { COLOR_16, COLOR_256, COLOR_24BIT } ColorMode;
 typedef enum { FMT_ANS, FMT_BIN } OutputFormat;
+typedef enum { RESAMPLE_BOX, RESAMPLE_LANCZOS } ResampleMode;
 
 /* Double-buffered floating-point pixel for dithering */
 typedef struct { double r, g, b; } FRGB;
@@ -119,6 +126,7 @@ typedef struct {
     GlyphSet     glyph_set;     /* standard or extended */
     ColorMode    color_mode;    /* 16, 256, or 24-bit */
     OutputFormat format;        /* ans or bin */
+    ResampleMode resample;      /* box (default) or lanczos */
     /* SAUCE */
     int          sauce;
     char         title[36];
@@ -423,6 +431,85 @@ static RGB sample_pixel(const uint8_t *img, int img_w, int img_h,
     double x1 = cx + (double)(gx+1) * cw / GLYPH_W;
     double y1 = cy + (double)(gy+1) * ch_ / GLYPH_H;
     return sample_region(img, img_w, img_h, x0, y0, x1, y1, gamma_correct);
+}
+
+/* -------------------------------------------------------------------------
+ * Lanczos-3 resampling: high-quality downscaler
+ * ---------------------------------------------------------------------- */
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+static double lanczos_kernel(double x, double a) {
+    if (x == 0.0) return 1.0;
+    if (x < -a || x > a) return 0.0;
+    double px = M_PI * x;
+    return a * sin(px) * sin(px / a) / (px * px);
+}
+
+/* Resize image to dst_w x dst_h using Lanczos-3 (separable, 2-pass) */
+static uint8_t *resize_lanczos(const uint8_t *src, int sw, int sh,
+                                 int dw, int dh) {
+    const double a = 3.0; /* Lanczos-3 */
+
+    /* Temporary buffer for horizontal pass */
+    double *tmp = (double *)malloc((size_t)(dw * sh * 3) * sizeof(double));
+    uint8_t *dst = (uint8_t *)malloc((size_t)(dw * dh * 3));
+    if (!tmp || !dst) { free(tmp); free(dst); return NULL; }
+
+    /* Horizontal pass: src (sw x sh) -> tmp (dw x sh) */
+    double sx_ratio = (double)sw / dw;
+    double support_x = (sx_ratio > 1.0) ? a * sx_ratio : a;
+
+    for (int y = 0; y < sh; y++) {
+        for (int x = 0; x < dw; x++) {
+            double center = (x + 0.5) * sx_ratio - 0.5;
+            int x0 = (int)floor(center - support_x);
+            int x1 = (int)ceil(center + support_x);
+            double sum_r = 0, sum_g = 0, sum_b = 0, sum_w = 0;
+            for (int sx = x0; sx <= x1; sx++) {
+                int csx = sx < 0 ? 0 : (sx >= sw ? sw - 1 : sx);
+                double w = lanczos_kernel((sx - center) / (sx_ratio > 1.0 ? sx_ratio : 1.0), a);
+                sum_r += w * src[(y * sw + csx) * 3 + 0];
+                sum_g += w * src[(y * sw + csx) * 3 + 1];
+                sum_b += w * src[(y * sw + csx) * 3 + 2];
+                sum_w += w;
+            }
+            if (sum_w != 0.0) { sum_r /= sum_w; sum_g /= sum_w; sum_b /= sum_w; }
+            tmp[(y * dw + x) * 3 + 0] = sum_r;
+            tmp[(y * dw + x) * 3 + 1] = sum_g;
+            tmp[(y * dw + x) * 3 + 2] = sum_b;
+        }
+    }
+
+    /* Vertical pass: tmp (dw x sh) -> dst (dw x dh) */
+    double sy_ratio = (double)sh / dh;
+    double support_y = (sy_ratio > 1.0) ? a * sy_ratio : a;
+
+    for (int x = 0; x < dw; x++) {
+        for (int y = 0; y < dh; y++) {
+            double center = (y + 0.5) * sy_ratio - 0.5;
+            int y0 = (int)floor(center - support_y);
+            int y1 = (int)ceil(center + support_y);
+            double sum_r = 0, sum_g = 0, sum_b = 0, sum_w = 0;
+            for (int sy = y0; sy <= y1; sy++) {
+                int csy = sy < 0 ? 0 : (sy >= sh ? sh - 1 : sy);
+                double w = lanczos_kernel((sy - center) / (sy_ratio > 1.0 ? sy_ratio : 1.0), a);
+                sum_r += w * tmp[(csy * dw + x) * 3 + 0];
+                sum_g += w * tmp[(csy * dw + x) * 3 + 1];
+                sum_b += w * tmp[(csy * dw + x) * 3 + 2];
+                sum_w += w;
+            }
+            if (sum_w != 0.0) { sum_r /= sum_w; sum_g /= sum_w; sum_b /= sum_w; }
+            dst[(y * dw + x) * 3 + 0] = (uint8_t)clamp_byte((int)(sum_r + 0.5));
+            dst[(y * dw + x) * 3 + 1] = (uint8_t)clamp_byte((int)(sum_g + 0.5));
+            dst[(y * dw + x) * 3 + 2] = (uint8_t)clamp_byte((int)(sum_b + 0.5));
+        }
+    }
+
+    free(tmp);
+    return dst;
 }
 
 /* -------------------------------------------------------------------------
@@ -834,6 +921,15 @@ static Cell *convert_image(const uint8_t *img, int img_w, int img_h,
     double cw = (double)img_w / cols;
     double ch = (double)img_h / rows;
 
+    /* Lanczos pre-resize: resample source to exact pixel grid */
+    uint8_t *resized = NULL;
+    int r_w = cols * GLYPH_W, r_h = rows * GLYPH_H;
+    if (opt->resample == RESAMPLE_LANCZOS) {
+        resized = resize_lanczos(img, img_w, img_h, r_w, r_h);
+        if (!resized) die("out of memory (lanczos resize)");
+        fprintf(stderr, "img2ans: lanczos resampled %dx%d -> %dx%d\n", img_w, img_h, r_w, r_h);
+    }
+
     /* Allocate output */
     Cell *cells = malloc((size_t)(cols * rows) * sizeof(Cell));
     if (!cells) { fprintf(stderr, "img2ans: out of memory\n"); exit(1); }
@@ -847,11 +943,22 @@ static Cell *convert_image(const uint8_t *img, int img_w, int img_h,
         for (int cx = 0; cx < cols; cx++) {
             /* Collect 16x8 subpixel samples for glyph matching */
             RGB samples[16][8];
-            double ox = cx * cw;
-            double oy = cy * ch;
-            for (int py = 0; py < 16; py++)
-                for (int px = 0; px < 8; px++)
-                    samples[py][px] = sample_pixel(img, img_w, img_h, ox, oy, cw, ch, px, py, opt->gamma_correct);
+            if (resized) {
+                /* Direct read from pre-resized image */
+                for (int py = 0; py < 16; py++)
+                    for (int px = 0; px < 8; px++) {
+                        int rx = cx * GLYPH_W + px;
+                        int ry = cy * GLYPH_H + py;
+                        const uint8_t *p = &resized[(ry * r_w + rx) * 3];
+                        samples[py][px] = (RGB){p[0], p[1], p[2]};
+                    }
+            } else {
+                double ox = cx * cw;
+                double oy = cy * ch;
+                for (int py = 0; py < 16; py++)
+                    for (int px = 0; px < 8; px++)
+                        samples[py][px] = sample_pixel(img, img_w, img_h, ox, oy, cw, ch, px, py, opt->gamma_correct);
+            }
 
             /* Apply dither: ordered uses Bayer threshold, others use error buffer */
             if (opt->dither == DITHER_ORDERED) {
@@ -927,6 +1034,7 @@ static Cell *convert_image(const uint8_t *img, int img_w, int img_h,
         }
     }
 
+    free(resized);
     return cells;
 }
 
@@ -1240,6 +1348,7 @@ static void usage(const char *prog) {
         "  --glyphs SET   glyph set: standard (default) or extended\n"
         "  --colors MODE  color mode: 16 (default), 256, or 24bit\n"
         "  --format FMT   output format: ans (default) or bin\n"
+        "  --resample M   resampling: box (default) or lanczos\n"
         "  --sauce        embed SAUCE metadata record\n"
         "  --title STR    SAUCE title (implies --sauce)\n"
         "  --author STR   SAUCE author (implies --sauce)\n"
@@ -1248,11 +1357,6 @@ static void usage(const char *prog) {
         "\n"
         "output defaults to input filename with .ans extension.\n",
         prog);
-}
-
-static void die(const char *msg) {
-    fprintf(stderr, "img2ans: %s\n", msg);
-    exit(1);
 }
 
 int main(int argc, char *argv[]) {
@@ -1269,6 +1373,7 @@ int main(int argc, char *argv[]) {
     opt.glyph_set = GLYPH_STANDARD;
     opt.color_mode = COLOR_16;
     opt.format = FMT_ANS;
+    opt.resample = RESAMPLE_BOX;
 
     const char *in_file  = NULL;
     const char *out_file = NULL;
@@ -1312,6 +1417,11 @@ int main(int argc, char *argv[]) {
             if (strcmp(argv[i], "ans") == 0)       opt.format = FMT_ANS;
             else if (strcmp(argv[i], "bin") == 0)  opt.format = FMT_BIN;
             else die("unknown format (ans|bin)");
+        } else if (strcmp(argv[i], "--resample") == 0 && i+1 < argc) {
+            i++;
+            if (strcmp(argv[i], "box") == 0)        opt.resample = RESAMPLE_BOX;
+            else if (strcmp(argv[i], "lanczos") == 0) opt.resample = RESAMPLE_LANCZOS;
+            else die("unknown resample mode (box|lanczos)");
         } else if (strcmp(argv[i], "--dither") == 0 && i+1 < argc) {
             i++;
             if (strcmp(argv[i], "none") == 0)         opt.dither = DITHER_NONE;
