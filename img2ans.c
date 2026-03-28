@@ -82,6 +82,7 @@ typedef struct { uint8_t ch, attr; } Cell; /* attr = (bg<<4)|fg */
 typedef enum { METRIC_RGB, METRIC_REDMEAN, METRIC_YCBCR } ColorMetric;
 typedef enum { DITHER_NONE, DITHER_FS, DITHER_ATKINSON, DITHER_ORDERED, DITHER_JJN } DitherMode;
 typedef enum { PAL_VGA, PAL_WIN } PaletteKind;
+typedef enum { GLYPH_STANDARD, GLYPH_EXTENDED } GlyphSet;
 
 /* Double-buffered floating-point pixel for dithering */
 typedef struct { double r, g, b; } FRGB;
@@ -103,6 +104,7 @@ typedef struct {
     ColorMetric  metric;
     int          gamma_correct; /* linearize before averaging */
     double       sharpen;       /* unsharp mask strength (0 = off) */
+    GlyphSet     glyph_set;     /* standard or extended */
     /* SAUCE */
     int          sauce;
     char         title[36];
@@ -119,10 +121,10 @@ typedef struct {
  * Only the nine glyphs used for ANSI art rendering are included.
  * ---------------------------------------------------------------------- */
 
-/* Nine glyphs: space, shade (B0/B1/B2), full block, four half-blocks */
+/* Nine core glyphs: space, shade (B0/B1/B2), full block, four half-blocks */
 typedef struct { uint8_t ch; uint8_t rows[16]; } FontGlyph;
 
-static const FontGlyph FONT_GLYPHS[] = {
+static const FontGlyph FONT_GLYPHS_STANDARD[] = {
     /* 0x20 space - 0/128 = 0% */
     { 0x20, { 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
               0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 } },
@@ -138,7 +140,7 @@ static const FontGlyph FONT_GLYPHS[] = {
     /* 0xDB full block - 128/128 = 100% */
     { 0xDB, { 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
               0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF } },
-    /* 0xDC lower half - rows 7-15 filled */
+    /* 0xDC lower half - rows 8-15 filled */
     { 0xDC, { 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFF,
               0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF } },
     /* 0xDD left half - left 4 pixels */
@@ -147,28 +149,97 @@ static const FontGlyph FONT_GLYPHS[] = {
     /* 0xDE right half - right 4 pixels */
     { 0xDE, { 0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,
               0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F } },
-    /* 0xDF upper half - rows 0-6 filled */
+    /* 0xDF upper half - rows 0-7 filled */
     { 0xDF, { 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00,
               0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 } },
 };
 
-#define NUM_GLYPHS  (int)(sizeof(FONT_GLYPHS)/sizeof(FONT_GLYPHS[0]))
+#define NUM_STANDARD  (int)(sizeof(FONT_GLYPHS_STANDARD)/sizeof(FONT_GLYPHS_STANDARD[0]))
+
+/* Extended glyphs: box-drawing, geometric shapes, and partial fills.
+ * All bitmaps from the IBM VGA 8x16 character generator ROM. */
+static const FontGlyph FONT_GLYPHS_EXTENDED[] = {
+    /* 0xB3 box single vertical bar */
+    { 0xB3, { 0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x18,
+              0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x18 } },
+    /* 0xBA box double vertical bar */
+    { 0xBA, { 0x36,0x36,0x36,0x36,0x36,0x36,0x36,0x36,
+              0x36,0x36,0x36,0x36,0x36,0x36,0x36,0x36 } },
+    /* 0xC4 box single horizontal bar */
+    { 0xC4, { 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFF,
+              0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 } },
+    /* 0xCD box double horizontal bar */
+    { 0xCD, { 0x00,0x00,0x00,0x00,0x00,0xFF,0x00,0xFF,
+              0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 } },
+    /* 0x16 right-pointing triangle (filled) */
+    { 0x16, { 0x00,0x00,0x80,0xC0,0xE0,0xF0,0xF8,0xFC,
+              0xF8,0xF0,0xE0,0xC0,0x80,0x00,0x00,0x00 } },
+    /* 0x17 left-pointing triangle (filled) */
+    { 0x17, { 0x00,0x00,0x02,0x06,0x0E,0x1E,0x3E,0x7E,
+              0x3E,0x1E,0x0E,0x06,0x02,0x00,0x00,0x00 } },
+    /* 0x1E up-pointing triangle */
+    { 0x1E, { 0x00,0x00,0x18,0x18,0x3C,0x3C,0x7E,0x7E,
+              0xFF,0xFF,0x00,0x00,0x00,0x00,0x00,0x00 } },
+    /* 0x1F down-pointing triangle */
+    { 0x1F, { 0x00,0x00,0x00,0x00,0x00,0xFF,0xFF,0x7E,
+              0x7E,0x3C,0x3C,0x18,0x18,0x00,0x00,0x00 } },
+    /* 0x2F forward slash (diagonal) */
+    { 0x2F, { 0x00,0x00,0x02,0x04,0x08,0x08,0x10,0x10,
+              0x20,0x20,0x40,0x80,0x00,0x00,0x00,0x00 } },
+    /* 0x5C backslash (diagonal) */
+    { 0x5C, { 0x00,0x00,0x80,0x40,0x20,0x20,0x10,0x10,
+              0x08,0x08,0x04,0x02,0x00,0x00,0x00,0x00 } },
+    /* 0xFE small square (centered) */
+    { 0xFE, { 0x00,0x00,0x00,0x00,0x7E,0x7E,0x7E,0x7E,
+              0x7E,0x7E,0x7E,0x00,0x00,0x00,0x00,0x00 } },
+    /* 0x04 diamond */
+    { 0x04, { 0x00,0x00,0x08,0x1C,0x3E,0x7F,0x3E,0x1C,
+              0x08,0x00,0x00,0x00,0x00,0x00,0x00,0x00 } },
+    /* 0x09 circle (outlined) */
+    { 0x09, { 0x00,0x00,0x3C,0x42,0x42,0x42,0x42,0x42,
+              0x42,0x3C,0x00,0x00,0x00,0x00,0x00,0x00 } },
+    /* 0x08 inverse bullet (filled circle) */
+    { 0x08, { 0x00,0x00,0x3C,0x7E,0x7E,0x7E,0x7E,0x7E,
+              0x7E,0x3C,0x00,0x00,0x00,0x00,0x00,0x00 } },
+};
+
+#define NUM_EXTENDED  (int)(sizeof(FONT_GLYPHS_EXTENDED)/sizeof(FONT_GLYPHS_EXTENDED[0]))
+
+#define MAX_GLYPHS  (NUM_STANDARD + NUM_EXTENDED)
 
 /* Precomputed glyph cache */
-static GlyphInfo g_glyphs[9];   /* matches NUM_GLYPHS */
+static GlyphInfo g_glyphs[MAX_GLYPHS];
 static int       g_num_glyphs = 0;
 
-static void init_glyphs(void) {
-    g_num_glyphs = NUM_GLYPHS;
-    for (int i = 0; i < NUM_GLYPHS; i++) {
-        g_glyphs[i].ch = FONT_GLYPHS[i].ch;
-        memcpy(g_glyphs[i].rows, FONT_GLYPHS[i].rows, 16);
+static void init_glyphs(GlyphSet set) {
+    g_num_glyphs = 0;
+
+    /* Always include standard glyphs */
+    for (int i = 0; i < NUM_STANDARD; i++) {
+        g_glyphs[g_num_glyphs].ch = FONT_GLYPHS_STANDARD[i].ch;
+        memcpy(g_glyphs[g_num_glyphs].rows, FONT_GLYPHS_STANDARD[i].rows, 16);
         int cnt = 0;
         for (int row = 0; row < 16; row++) {
-            uint8_t b = FONT_GLYPHS[i].rows[row];
+            uint8_t b = FONT_GLYPHS_STANDARD[i].rows[row];
             while (b) { cnt += (b & 1); b >>= 1; }
         }
-        g_glyphs[i].on_count = cnt;
+        g_glyphs[g_num_glyphs].on_count = cnt;
+        g_num_glyphs++;
+    }
+
+    /* Extended set adds box-drawing, geometric shapes */
+    if (set == GLYPH_EXTENDED) {
+        for (int i = 0; i < NUM_EXTENDED; i++) {
+            g_glyphs[g_num_glyphs].ch = FONT_GLYPHS_EXTENDED[i].ch;
+            memcpy(g_glyphs[g_num_glyphs].rows, FONT_GLYPHS_EXTENDED[i].rows, 16);
+            int cnt = 0;
+            for (int row = 0; row < 16; row++) {
+                uint8_t b = FONT_GLYPHS_EXTENDED[i].rows[row];
+                while (b) { cnt += (b & 1); b >>= 1; }
+            }
+            g_glyphs[g_num_glyphs].on_count = cnt;
+            g_num_glyphs++;
+        }
     }
 }
 
@@ -869,6 +940,7 @@ static void usage(const char *prog) {
         "  --gamma        gamma-correct resampling (linear light averaging)\n"
         "  --no-gamma     disable gamma correction (default)\n"
         "  --sharpen N    unsharp mask strength (default: off, try 0.5-2.0)\n"
+        "  --glyphs SET   glyph set: standard (default) or extended\n"
         "  --sauce        embed SAUCE metadata record\n"
         "  --title STR    SAUCE title (implies --sauce)\n"
         "  --author STR   SAUCE author (implies --sauce)\n"
@@ -895,6 +967,7 @@ int main(int argc, char *argv[]) {
     opt.sauce   = 0;
     opt.gamma_correct = 0;
     opt.sharpen = 0.0;
+    opt.glyph_set = GLYPH_STANDARD;
 
     const char *in_file  = NULL;
     const char *out_file = NULL;
@@ -922,6 +995,11 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--sharpen") == 0 && i+1 < argc) {
             opt.sharpen = atof(argv[++i]);
             if (opt.sharpen < 0.0) die("--sharpen must be >= 0");
+        } else if (strcmp(argv[i], "--glyphs") == 0 && i+1 < argc) {
+            i++;
+            if (strcmp(argv[i], "standard") == 0)      opt.glyph_set = GLYPH_STANDARD;
+            else if (strcmp(argv[i], "extended") == 0)  opt.glyph_set = GLYPH_EXTENDED;
+            else die("unknown glyph set (standard|extended)");
         } else if (strcmp(argv[i], "--dither") == 0 && i+1 < argc) {
             i++;
             if (strcmp(argv[i], "none") == 0)         opt.dither = DITHER_NONE;
@@ -984,7 +1062,7 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "img2ans: loaded %dx%d from '%s'\n", img_w, img_h, in_file);
 
     /* Init glyph cache */
-    init_glyphs();
+    init_glyphs(opt.glyph_set);
     if (opt.gamma_correct)
         init_gamma_tables();
 
