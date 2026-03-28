@@ -102,6 +102,7 @@ typedef enum { GLYPH_STANDARD, GLYPH_EXTENDED } GlyphSet;
 typedef enum { COLOR_16, COLOR_256, COLOR_24BIT } ColorMode;
 typedef enum { FMT_ANS, FMT_BIN } OutputFormat;
 typedef enum { RESAMPLE_BOX, RESAMPLE_LANCZOS } ResampleMode;
+typedef enum { CHARSET_ANSI, CHARSET_PETSCII } CharSet;
 
 /* Double-buffered floating-point pixel for dithering */
 typedef struct { double r, g, b; } FRGB;
@@ -127,6 +128,7 @@ typedef struct {
     ColorMode    color_mode;    /* 16, 256, or 24-bit */
     OutputFormat format;        /* ans or bin */
     ResampleMode resample;      /* box (default) or lanczos */
+    CharSet      charset;       /* ansi (default) or petscii */
     /* SAUCE */
     int          sauce;
     char         title[36];
@@ -306,6 +308,70 @@ static void init_xterm256(void) {
     for (int i = 0; i < 24; i++) {
         uint8_t v = (uint8_t)(8 + i * 10);
         XTERM256[232+i] = (RGB){v, v, v};
+    }
+}
+
+/* C64 color palette (VICE default, widely accepted as canonical) */
+static const RGB C64_PAL[16] = {
+    {  0,  0,  0}, {255,255,255}, {136, 57, 50}, {103,182,189},
+    {139, 63,150}, { 85,160, 73}, { 64, 49,141}, {191,206,114},
+    {139, 84, 41}, { 87, 66,  0}, {184,105, 98}, { 80, 80, 80},
+    {120,120,120}, {148,224,137}, {120,105,196}, {159,159,159},
+};
+
+/* PETSCII glyph bitmaps: 8x8 upper-case/graphics set (C64 ROM).
+ * Each glyph is 8 rows of 8 bits. Subset most useful for image rendering. */
+typedef struct { uint8_t code; uint8_t rows[8]; } PetsciiGlyph;
+
+static const PetsciiGlyph PETSCII_GLYPHS[] = {
+    /* space */
+    { 0x20, { 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 } },
+    /* full block (reverse space) */
+    { 0xA0, { 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF } },
+    /* upper half */
+    { 0xA3, { 0xFF,0xFF,0xFF,0xFF,0x00,0x00,0x00,0x00 } },
+    /* lower half */
+    { 0xE2, { 0x00,0x00,0x00,0x00,0xFF,0xFF,0xFF,0xFF } },
+    /* left half */
+    { 0xA1, { 0xF0,0xF0,0xF0,0xF0,0xF0,0xF0,0xF0,0xF0 } },
+    /* right half */
+    { 0xE1, { 0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F } },
+    /* upper-left quadrant */
+    { 0xFE, { 0xF0,0xF0,0xF0,0xF0,0x00,0x00,0x00,0x00 } },
+    /* upper-right quadrant */
+    { 0xFC, { 0x0F,0x0F,0x0F,0x0F,0x00,0x00,0x00,0x00 } },
+    /* lower-left quadrant */
+    { 0xFB, { 0x00,0x00,0x00,0x00,0xF0,0xF0,0xF0,0xF0 } },
+    /* lower-right quadrant */
+    { 0xEC, { 0x00,0x00,0x00,0x00,0x0F,0x0F,0x0F,0x0F } },
+    /* checkerboard */
+    { 0xE6, { 0xAA,0x55,0xAA,0x55,0xAA,0x55,0xAA,0x55 } },
+    /* upper-right triangle */
+    { 0xBF, { 0x01,0x03,0x07,0x0F,0x1F,0x3F,0x7F,0xFF } },
+    /* lower-left triangle */
+    { 0xCE, { 0xFF,0x7F,0x3F,0x1F,0x0F,0x07,0x03,0x01 } },
+};
+
+#define NUM_PETSCII_GLYPHS  (int)(sizeof(PETSCII_GLYPHS)/sizeof(PETSCII_GLYPHS[0]))
+
+/* Precomputed PETSCII glyph cache (GlyphInfo with 8x8, padded to 16 rows) */
+static GlyphInfo g_petscii[64];
+static int       g_petscii_num = 0;
+
+static void init_petscii(void) {
+    g_petscii_num = 0;
+    for (int i = 0; i < NUM_PETSCII_GLYPHS; i++) {
+        GlyphInfo *gi = &g_petscii[g_petscii_num];
+        gi->ch = PETSCII_GLYPHS[i].code;
+        memset(gi->rows, 0, 16);
+        memcpy(gi->rows, PETSCII_GLYPHS[i].rows, 8);
+        int cnt = 0;
+        for (int row = 0; row < 8; row++) {
+            uint8_t b = PETSCII_GLYPHS[i].rows[row];
+            while (b) { cnt += (b & 1); b >>= 1; }
+        }
+        gi->on_count = cnt;
+        g_petscii_num++;
     }
 }
 
@@ -853,6 +919,52 @@ static Cell best_cell_24bit(RGB samples[16][8], ColorMetric m) {
     return best;
 }
 
+/* Best cell search for PETSCII: 8x8 glyphs, C64 16-color palette */
+static Cell best_cell_petscii(const RGB samples[8][8], ColorMetric m) {
+    long best_err = LONG_MAX;
+    Cell best = { 0x20, 0, 0, 0, {0,0,0}, {0,0,0} };
+
+    /* Solid space candidates: all 16 BG colors */
+    for (int bg = 0; bg < 16; bg++) {
+        long err = 0;
+        for (int py = 0; py < 8; py++)
+            for (int px = 0; px < 8; px++)
+                err += pal_dist2(samples[py][px], C64_PAL[bg], m);
+        if (err < best_err) {
+            best_err = err;
+            best.ch = 0x20;
+            best.attr = (uint8_t)((bg << 4) | 0);
+        }
+    }
+
+    /* All PETSCII glyphs x 16 FG x 16 BG */
+    for (int gi = 0; gi < g_petscii_num; gi++) {
+        const GlyphInfo *g = &g_petscii[gi];
+        if (g->on_count == 0) continue; /* skip space, already covered */
+        for (int fg = 0; fg < 16; fg++) {
+            for (int bg = 0; bg < 16; bg++) {
+                if (fg == bg && g->on_count != 64) continue;
+                /* Use pixel-by-pixel error (8x8 glyphs are spatially coherent) */
+                long err = 0;
+                for (int py = 0; py < 8; py++) {
+                    uint8_t row = g->rows[py];
+                    for (int px = 0; px < 8; px++) {
+                        int on = (row >> (7 - px)) & 1;
+                        err += pal_dist2(samples[py][px], on ? C64_PAL[fg] : C64_PAL[bg], m);
+                    }
+                }
+                if (err < best_err) {
+                    best_err = err;
+                    best.ch = g->ch;
+                    best.attr = (uint8_t)((bg << 4) | fg);
+                }
+            }
+        }
+    }
+
+    return best;
+}
+
 /* -------------------------------------------------------------------------
  * Pre-processing: unsharp mask for detail recovery
  * ---------------------------------------------------------------------- */
@@ -898,18 +1010,24 @@ static Cell *convert_image(const uint8_t *img, int img_w, int img_h,
                             const Options *opt, int *out_cols, int *out_rows) {
     const RGB *pal = get_palette(opt->palette);
 
+    /* PETSCII vs ANSI cell geometry */
+    int glyph_w = GLYPH_W;  /* always 8 */
+    int glyph_h = (opt->charset == CHARSET_PETSCII) ? 8 : GLYPH_H;
+
     /* Determine output dimensions */
-    int cols = opt->cols > 0 ? opt->cols : COLS;
+    int cols = opt->cols > 0 ? opt->cols : ((opt->charset == CHARSET_PETSCII) ? 40 : COLS);
     int rows;
     if (opt->rows > 0) {
         rows = opt->rows;
     } else {
-        /* Auto: preserve aspect ratio. Cell aspect is 8px wide x 16px tall.
-         * img px -> cells: cols*8 px wide maps to img_w px, so scale factor is cols*8/img_w.
-         * Height in cells: img_h * (cols*8/img_w) / 16, simplified:
-         *   rows = img_h * cols / (img_w * 2)   (the /2 accounts for 2:1 cell aspect)
+        /* Auto: preserve aspect ratio.
+         * ANSI cells are 8x16 (2:1 aspect), PETSCII are 8x8 (1:1).
          */
-        rows = (img_h * cols) / (img_w * 2);
+        if (opt->charset == CHARSET_PETSCII) {
+            rows = (img_h * cols) / img_w;
+        } else {
+            rows = (img_h * cols) / (img_w * 2);
+        }
         if (rows < 1) rows = 1;
         if (rows > MAX_ROWS) rows = MAX_ROWS;
     }
@@ -923,7 +1041,7 @@ static Cell *convert_image(const uint8_t *img, int img_w, int img_h,
 
     /* Lanczos pre-resize: resample source to exact pixel grid */
     uint8_t *resized = NULL;
-    int r_w = cols * GLYPH_W, r_h = rows * GLYPH_H;
+    int r_w = cols * glyph_w, r_h = rows * glyph_h;
     if (opt->resample == RESAMPLE_LANCZOS) {
         resized = resize_lanczos(img, img_w, img_h, r_w, r_h);
         if (!resized) die("out of memory (lanczos resize)");
@@ -941,22 +1059,22 @@ static Cell *convert_image(const uint8_t *img, int img_w, int img_h,
 
     for (int cy = 0; cy < rows; cy++) {
         for (int cx = 0; cx < cols; cx++) {
-            /* Collect 16x8 subpixel samples for glyph matching */
+            /* Collect subpixel samples: 16x8 for ANSI, 8x8 for PETSCII */
             RGB samples[16][8];
+            memset(samples, 0, sizeof(samples));
             if (resized) {
-                /* Direct read from pre-resized image */
-                for (int py = 0; py < 16; py++)
-                    for (int px = 0; px < 8; px++) {
-                        int rx = cx * GLYPH_W + px;
-                        int ry = cy * GLYPH_H + py;
+                for (int py = 0; py < glyph_h; py++)
+                    for (int px = 0; px < glyph_w; px++) {
+                        int rx = cx * glyph_w + px;
+                        int ry = cy * glyph_h + py;
                         const uint8_t *p = &resized[(ry * r_w + rx) * 3];
                         samples[py][px] = (RGB){p[0], p[1], p[2]};
                     }
             } else {
                 double ox = cx * cw;
                 double oy = cy * ch;
-                for (int py = 0; py < 16; py++)
-                    for (int px = 0; px < 8; px++)
+                for (int py = 0; py < glyph_h; py++)
+                    for (int px = 0; px < glyph_w; px++)
                         samples[py][px] = sample_pixel(img, img_w, img_h, ox, oy, cw, ch, px, py, opt->gamma_correct);
             }
 
@@ -986,7 +1104,10 @@ static Cell *convert_image(const uint8_t *img, int img_w, int img_h,
 
             /* Find best cell */
             Cell cell;
-            if (opt->color_mode == COLOR_256) {
+            if (opt->charset == CHARSET_PETSCII) {
+                /* Cast to 8x8 - only top 8 rows used */
+                cell = best_cell_petscii((const RGB (*)[8])samples, opt->metric);
+            } else if (opt->color_mode == COLOR_256) {
                 cell = best_cell_256(samples, XTERM256, opt->metric);
             } else if (opt->color_mode == COLOR_24BIT) {
                 cell = best_cell_24bit(samples, opt->metric);
@@ -999,12 +1120,25 @@ static Cell *convert_image(const uint8_t *img, int img_w, int img_h,
             if (opt->dither == DITHER_FS || opt->dither == DITHER_ATKINSON || opt->dither == DITHER_JJN) {
                 /* Compute the approximate RGB that this cell renders */
                 const GlyphInfo *g = NULL;
-                for (int gi = 0; gi < g_num_glyphs; gi++) {
-                    if (g_glyphs[gi].ch == cell.ch) { g = &g_glyphs[gi]; break; }
+                int total_pixels = glyph_w * glyph_h; /* 128 for ANSI, 64 for PETSCII */
+
+                if (opt->charset == CHARSET_PETSCII) {
+                    for (int gi = 0; gi < g_petscii_num; gi++) {
+                        if (g_petscii[gi].ch == cell.ch) { g = &g_petscii[gi]; break; }
+                    }
+                } else {
+                    for (int gi = 0; gi < g_num_glyphs; gi++) {
+                        if (g_glyphs[gi].ch == cell.ch) { g = &g_glyphs[gi]; break; }
+                    }
                 }
 
                 RGB fg_c, bg_c;
-                if (opt->color_mode == COLOR_24BIT) {
+                if (opt->charset == CHARSET_PETSCII) {
+                    int fg = cell.attr & 0x0F;
+                    int bg = (cell.attr >> 4) & 0x0F;
+                    fg_c = C64_PAL[fg];
+                    bg_c = C64_PAL[bg];
+                } else if (opt->color_mode == COLOR_24BIT) {
                     fg_c = cell.fg_rgb;
                     bg_c = cell.bg_rgb;
                 } else if (opt->color_mode == COLOR_256) {
@@ -1020,15 +1154,28 @@ static Cell *convert_image(const uint8_t *img, int img_w, int img_h,
                 RGB approx;
                 if (!g || g->on_count == 0) {
                     approx = bg_c;
-                } else if (g->on_count == 128) {
+                } else if (g->on_count == total_pixels) {
                     approx = fg_c;
                 } else {
-                    double alpha = (double)g->on_count / 128.0;
+                    double alpha = (double)g->on_count / (double)total_pixels;
                     approx.r = (uint8_t)clamp_byte((int)(alpha * fg_c.r + (1-alpha) * bg_c.r + 0.5));
                     approx.g = (uint8_t)clamp_byte((int)(alpha * fg_c.g + (1-alpha) * bg_c.g + 0.5));
                     approx.b = (uint8_t)clamp_byte((int)(alpha * fg_c.b + (1-alpha) * bg_c.b + 0.5));
                 }
-                RGB avg = avg_samples(samples);
+
+                /* Average of actual samples (use glyph_h rows, not always 16) */
+                long sr = 0, sg = 0, sb = 0;
+                for (int py = 0; py < glyph_h; py++)
+                    for (int px = 0; px < glyph_w; px++) {
+                        sr += samples[py][px].r;
+                        sg += samples[py][px].g;
+                        sb += samples[py][px].b;
+                    }
+                RGB avg = {
+                    (uint8_t)(sr / total_pixels),
+                    (uint8_t)(sg / total_pixels),
+                    (uint8_t)(sb / total_pixels),
+                };
                 diffuse_error(cx, cy, avg, approx, opt->dither);
             }
         }
@@ -1284,6 +1431,98 @@ static void save_bin(FILE *f, const Cell *cells, int cols, int rows) {
     }
 }
 
+/* PETSCII color control codes (C64):
+ * These are the PETSCII byte values that set the current text color. */
+static const uint8_t PETSCII_COLOR_CODES[16] = {
+    0x90, /* 0  black */
+    0x05, /* 1  white */
+    0x1C, /* 2  red */
+    0x9F, /* 3  cyan */
+    0x9C, /* 4  purple */
+    0x1E, /* 5  green */
+    0x1F, /* 6  dark blue */
+    0x9E, /* 7  yellow */
+    0x81, /* 8  orange */
+    0x95, /* 9  brown */
+    0x96, /* 10 light red */
+    0x97, /* 11 dark grey */
+    0x98, /* 12 grey */
+    0x99, /* 13 light green */
+    0x9A, /* 14 light blue */
+    0x9B, /* 15 light grey */
+};
+
+/* Save PETSCII output with C64 color control codes.
+ * Format: sequential stream of color codes + characters.
+ * Uses reverse mode (RVS ON = 0x12, RVS OFF = 0x92) for background colors.
+ * A PETSCII file is read by C64 terminal programs. */
+static void save_petscii(FILE *f, const Cell *cells, int cols, int rows) {
+    int cur_fg = -1;
+    int rvs_on = 0;
+
+    /* Clear screen: 0x93 */
+    uint8_t clr = 0x93;
+    write_bytes(f, &clr, 1);
+
+    for (int r = 0; r < rows; r++) {
+        for (int c = 0; c < cols; c++) {
+            const Cell *cell = &cells[r * cols + c];
+            int fg = cell->attr & 0x0F;
+            int bg = (cell->attr >> 4) & 0x0F;
+            uint8_t ch = cell->ch;
+
+            /* For space (empty), just set BG color as the "ink" in reverse mode */
+            if (ch == 0x20 || ch == 0xA0) {
+                /* Space: show bg color via reverse space, or normal space */
+                if (bg == 0 && !rvs_on) {
+                    /* Black bg, just emit space */
+                    if (cur_fg != fg) {
+                        write_bytes(f, &PETSCII_COLOR_CODES[fg], 1);
+                        cur_fg = fg;
+                    }
+                    uint8_t sp = 0x20;
+                    write_bytes(f, &sp, 1);
+                } else {
+                    /* Use reverse space to show bg color */
+                    if (cur_fg != bg) {
+                        write_bytes(f, &PETSCII_COLOR_CODES[bg], 1);
+                        cur_fg = bg;
+                    }
+                    if (!rvs_on) {
+                        uint8_t rv = 0x12;
+                        write_bytes(f, &rv, 1);
+                        rvs_on = 1;
+                    }
+                    uint8_t sp = 0x20;
+                    write_bytes(f, &sp, 1);
+                }
+            } else {
+                /* For other glyphs: fg color, with reverse off */
+                if (rvs_on) {
+                    uint8_t rv = 0x92;
+                    write_bytes(f, &rv, 1);
+                    rvs_on = 0;
+                }
+                if (cur_fg != fg) {
+                    write_bytes(f, &PETSCII_COLOR_CODES[fg], 1);
+                    cur_fg = fg;
+                }
+                write_bytes(f, &ch, 1);
+            }
+        }
+        /* Newline: CR */
+        if (r < rows - 1) {
+            if (rvs_on) {
+                uint8_t rv = 0x92;
+                write_bytes(f, &rv, 1);
+                rvs_on = 0;
+            }
+            uint8_t cr = 0x0D;
+            write_bytes(f, &cr, 1);
+        }
+    }
+}
+
 static void write_sauce(FILE *f, int cols, int rows, int ice,
                          long file_size_before, const Options *opt) {
     /* EOF marker */
@@ -1349,6 +1588,7 @@ static void usage(const char *prog) {
         "  --colors MODE  color mode: 16 (default), 256, or 24bit\n"
         "  --format FMT   output format: ans (default) or bin\n"
         "  --resample M   resampling: box (default) or lanczos\n"
+        "  --charset C    character set: ansi (default) or petscii\n"
         "  --sauce        embed SAUCE metadata record\n"
         "  --title STR    SAUCE title (implies --sauce)\n"
         "  --author STR   SAUCE author (implies --sauce)\n"
@@ -1374,6 +1614,7 @@ int main(int argc, char *argv[]) {
     opt.color_mode = COLOR_16;
     opt.format = FMT_ANS;
     opt.resample = RESAMPLE_BOX;
+    opt.charset = CHARSET_ANSI;
 
     const char *in_file  = NULL;
     const char *out_file = NULL;
@@ -1422,6 +1663,11 @@ int main(int argc, char *argv[]) {
             if (strcmp(argv[i], "box") == 0)        opt.resample = RESAMPLE_BOX;
             else if (strcmp(argv[i], "lanczos") == 0) opt.resample = RESAMPLE_LANCZOS;
             else die("unknown resample mode (box|lanczos)");
+        } else if (strcmp(argv[i], "--charset") == 0 && i+1 < argc) {
+            i++;
+            if (strcmp(argv[i], "ansi") == 0)        opt.charset = CHARSET_ANSI;
+            else if (strcmp(argv[i], "petscii") == 0) opt.charset = CHARSET_PETSCII;
+            else die("unknown charset (ansi|petscii)");
         } else if (strcmp(argv[i], "--dither") == 0 && i+1 < argc) {
             i++;
             if (strcmp(argv[i], "none") == 0)         opt.dither = DITHER_NONE;
@@ -1464,7 +1710,8 @@ int main(int argc, char *argv[]) {
 
     /* Build default output name: replace/append extension */
     static char out_buf[4096];
-    const char *ext = (opt.format == FMT_BIN) ? ".bin" : ".ans";
+    const char *ext = (opt.format == FMT_BIN) ? ".bin" :
+                      (opt.charset == CHARSET_PETSCII) ? ".pet" : ".ans";
     if (!out_file) {
         strncpy(out_buf, in_file, sizeof(out_buf) - 5);
         char *dot = strrchr(out_buf, '.');
@@ -1485,7 +1732,11 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "img2ans: loaded %dx%d from '%s'\n", img_w, img_h, in_file);
 
     /* Init glyph cache */
-    init_glyphs(opt.glyph_set);
+    if (opt.charset == CHARSET_PETSCII) {
+        init_petscii();
+    } else {
+        init_glyphs(opt.glyph_set);
+    }
     if (opt.gamma_correct)
         init_gamma_tables();
     if (opt.color_mode == COLOR_256)
@@ -1519,6 +1770,8 @@ int main(int argc, char *argv[]) {
 
     if (opt.format == FMT_BIN) {
         save_bin(f, cells, out_cols, out_rows);
+    } else if (opt.charset == CHARSET_PETSCII) {
+        save_petscii(f, cells, out_cols, out_rows);
     } else {
         save_ansi(f, cells, out_cols, out_rows, opt.ice, &opt);
     }
