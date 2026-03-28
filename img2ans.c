@@ -52,6 +52,26 @@
 #define CP437_RHALF    0xDE   /* right half block */
 #define CP437_SPACE    0x20
 
+/* sRGB linearization: gamma 2.2 approximation via lookup table */
+static float g_srgb_to_lin[256];
+static uint8_t g_lin_to_srgb[4096]; /* 12-bit linear -> 8-bit sRGB */
+
+static void init_gamma_tables(void) {
+    for (int i = 0; i < 256; i++)
+        g_srgb_to_lin[i] = (float)pow(i / 255.0, 2.2);
+    for (int i = 0; i < 4096; i++) {
+        double lin = i / 4095.0;
+        int s = (int)(pow(lin, 1.0 / 2.2) * 255.0 + 0.5);
+        g_lin_to_srgb[i] = (uint8_t)(s < 0 ? 0 : s > 255 ? 255 : s);
+    }
+}
+
+static inline uint8_t linear_to_srgb(float v) {
+    if (v <= 0.0f) return 0;
+    if (v >= 1.0f) return 255;
+    return g_lin_to_srgb[(int)(v * 4095.0f + 0.5f)];
+}
+
 /* -------------------------------------------------------------------------
  * Types
  * ---------------------------------------------------------------------- */
@@ -60,7 +80,7 @@ typedef struct { uint8_t r, g, b; } RGB;
 typedef struct { uint8_t ch, attr; } Cell; /* attr = (bg<<4)|fg */
 
 typedef enum { METRIC_RGB, METRIC_REDMEAN, METRIC_YCBCR } ColorMetric;
-typedef enum { DITHER_NONE, DITHER_FS, DITHER_ATKINSON } DitherMode;
+typedef enum { DITHER_NONE, DITHER_FS, DITHER_ATKINSON, DITHER_ORDERED, DITHER_JJN } DitherMode;
 typedef enum { PAL_VGA, PAL_WIN } PaletteKind;
 
 /* Double-buffered floating-point pixel for dithering */
@@ -81,6 +101,8 @@ typedef struct {
     int          ice;          /* allow 16 background colors */
     DitherMode   dither;
     ColorMetric  metric;
+    int          gamma_correct; /* linearize before averaging */
+    double       sharpen;       /* unsharp mask strength (0 = off) */
     /* SAUCE */
     int          sauce;
     char         title[36];
@@ -234,7 +256,8 @@ static long pal_dist2(RGB a, RGB b, ColorMetric m) {
 
 /* Sample average RGB over a region of the source image (bilinear area avg) */
 static RGB sample_region(const uint8_t *img, int img_w, int img_h,
-                          double x0, double y0, double x1, double y1) {
+                          double x0, double y0, double x1, double y1,
+                          int gamma_correct) {
     /* clamp */
     if (x0 < 0) x0 = 0;
     if (y0 < 0) y0 = 0;
@@ -242,7 +265,7 @@ static RGB sample_region(const uint8_t *img, int img_w, int img_h,
     if (y1 > img_h) y1 = img_h;
     if (x1 <= x0 || y1 <= y0) return (RGB){0,0,0};
 
-    double sumr = 0, sumg = 0, sumb = 0, weight = 0;
+    double sumr = 0, sumg = 0, sumb = 0, sumw = 0;
     int ix0 = (int)x0, iy0 = (int)y0;
     int ix1 = (int)ceil(x1), iy1 = (int)ceil(y1);
 
@@ -256,17 +279,30 @@ static RGB sample_region(const uint8_t *img, int img_w, int img_h,
             else if (px + 1.0 > x1) wx = x1 - px;
             double w = wx * wy;
             int idx = (py * img_w + px) * 3;
-            sumr += w * img[idx+0];
-            sumg += w * img[idx+1];
-            sumb += w * img[idx+2];
-            weight += w;
+            if (gamma_correct) {
+                sumr += w * g_srgb_to_lin[img[idx+0]];
+                sumg += w * g_srgb_to_lin[img[idx+1]];
+                sumb += w * g_srgb_to_lin[img[idx+2]];
+            } else {
+                sumr += w * img[idx+0];
+                sumg += w * img[idx+1];
+                sumb += w * img[idx+2];
+            }
+            sumw += w;
         }
     }
-    if (weight < 1e-9) return (RGB){0,0,0};
+    if (sumw < 1e-9) return (RGB){0,0,0};
+    if (gamma_correct) {
+        return (RGB){
+            linear_to_srgb((float)(sumr / sumw)),
+            linear_to_srgb((float)(sumg / sumw)),
+            linear_to_srgb((float)(sumb / sumw)),
+        };
+    }
     return (RGB){
-        (uint8_t)clamp_byte((int)(sumr / weight + 0.5)),
-        (uint8_t)clamp_byte((int)(sumg / weight + 0.5)),
-        (uint8_t)clamp_byte((int)(sumb / weight + 0.5)),
+        (uint8_t)clamp_byte((int)(sumr / sumw + 0.5)),
+        (uint8_t)clamp_byte((int)(sumg / sumw + 0.5)),
+        (uint8_t)clamp_byte((int)(sumb / sumw + 0.5)),
     };
 }
 
@@ -274,18 +310,27 @@ static RGB sample_region(const uint8_t *img, int img_w, int img_h,
 static RGB sample_pixel(const uint8_t *img, int img_w, int img_h,
                          double cx, double cy,     /* cell origin in img coords */
                          double cw, double ch_,    /* cell size in img coords */
-                         int gx, int gy)           /* glyph pixel 0..7, 0..15 */
+                         int gx, int gy,           /* glyph pixel 0..7, 0..15 */
+                         int gamma_correct)
 {
     double x0 = cx + (double)gx * cw / GLYPH_W;
     double y0 = cy + (double)gy * ch_ / GLYPH_H;
     double x1 = cx + (double)(gx+1) * cw / GLYPH_W;
     double y1 = cy + (double)(gy+1) * ch_ / GLYPH_H;
-    return sample_region(img, img_w, img_h, x0, y0, x1, y1);
+    return sample_region(img, img_w, img_h, x0, y0, x1, y1, gamma_correct);
 }
 
 /* -------------------------------------------------------------------------
  * Dithering: Floyd-Steinberg and Atkinson over the cell grid
  * ---------------------------------------------------------------------- */
+
+/* 4x4 Bayer ordered dithering threshold matrix (normalized to -0.5..+0.5) */
+static const double BAYER4[4][4] = {
+    { -0.46875, +0.03125, -0.34375, +0.15625 },
+    { +0.28125, -0.21875, +0.40625, -0.09375 },
+    { -0.28125, +0.21875, -0.40625, +0.09375 },
+    { +0.46875, -0.03125, +0.34375, -0.15625 },
+};
 
 /* Error buffer: one FRGB per cell, rows side-by-side */
 static FRGB *g_err = NULL;
@@ -333,6 +378,20 @@ static void diffuse_error(int x, int y, RGB avg, RGB approx, DitherMode dm) {
         err_add(x,   y+1, er*f, eg*f, eb*f);
         err_add(x+1, y+1, er*f, eg*f, eb*f);
         err_add(x,   y+2, er*f, eg*f, eb*f);
+    } else if (dm == DITHER_JJN) {
+        /* Jarvis-Judice-Ninke: 12 neighbors, divisor 48 */
+        err_add(x+1, y,   er*7/48, eg*7/48, eb*7/48);
+        err_add(x+2, y,   er*5/48, eg*5/48, eb*5/48);
+        err_add(x-2, y+1, er*3/48, eg*3/48, eb*3/48);
+        err_add(x-1, y+1, er*5/48, eg*5/48, eb*5/48);
+        err_add(x,   y+1, er*7/48, eg*7/48, eb*7/48);
+        err_add(x+1, y+1, er*5/48, eg*5/48, eb*5/48);
+        err_add(x+2, y+1, er*3/48, eg*3/48, eb*3/48);
+        err_add(x-2, y+2, er*1/48, eg*1/48, eb*1/48);
+        err_add(x-1, y+2, er*3/48, eg*3/48, eb*3/48);
+        err_add(x,   y+2, er*5/48, eg*5/48, eb*5/48);
+        err_add(x+1, y+2, er*3/48, eg*3/48, eb*3/48);
+        err_add(x+2, y+2, er*1/48, eg*1/48, eb*1/48);
     }
 }
 
@@ -441,6 +500,43 @@ static Cell best_cell(const RGB samples[16][8], const RGB *pal,
 }
 
 /* -------------------------------------------------------------------------
+ * Pre-processing: unsharp mask for detail recovery
+ * ---------------------------------------------------------------------- */
+
+/* Apply unsharp mask: sharpened = original + amount * (original - blurred).
+ * Uses a 3x3 Gaussian-like kernel [1 2 1; 2 4 2; 1 2 1] / 16. */
+static uint8_t *sharpen_image(const uint8_t *img, int w, int h, double amount) {
+    uint8_t *out = malloc((size_t)(w * h * 3));
+    if (!out) return NULL;
+
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            for (int c = 0; c < 3; c++) {
+                /* 3x3 weighted average */
+                double sum = 0;
+                static const int kw[3] = {1, 2, 1};
+                for (int ky = -1; ky <= 1; ky++) {
+                    int sy = y + ky;
+                    if (sy < 0) sy = 0;
+                    if (sy >= h) sy = h - 1;
+                    for (int kx = -1; kx <= 1; kx++) {
+                        int sx = x + kx;
+                        if (sx < 0) sx = 0;
+                        if (sx >= w) sx = w - 1;
+                        sum += kw[ky+1] * kw[kx+1] * img[(sy * w + sx) * 3 + c];
+                    }
+                }
+                double blurred = sum / 16.0;
+                double orig = img[(y * w + x) * 3 + c];
+                double sharp = orig + amount * (orig - blurred);
+                out[(y * w + x) * 3 + c] = (uint8_t)clamp_byte((int)(sharp + 0.5));
+            }
+        }
+    }
+    return out;
+}
+
+/* -------------------------------------------------------------------------
  * Main conversion: image -> cell array
  * ---------------------------------------------------------------------- */
 
@@ -475,8 +571,8 @@ static Cell *convert_image(const uint8_t *img, int img_w, int img_h,
     Cell *cells = malloc((size_t)(cols * rows) * sizeof(Cell));
     if (!cells) { fprintf(stderr, "img2ans: out of memory\n"); exit(1); }
 
-    /* Dither error buffer */
-    if (opt->dither != DITHER_NONE) {
+    /* Dither error buffer (for error-diffusion modes) */
+    if (opt->dither == DITHER_FS || opt->dither == DITHER_ATKINSON || opt->dither == DITHER_JJN) {
         err_alloc(cols, rows);
     }
 
@@ -488,10 +584,21 @@ static Cell *convert_image(const uint8_t *img, int img_w, int img_h,
             double oy = cy * ch;
             for (int py = 0; py < 16; py++)
                 for (int px = 0; px < 8; px++)
-                    samples[py][px] = sample_pixel(img, img_w, img_h, ox, oy, cw, ch, px, py);
+                    samples[py][px] = sample_pixel(img, img_w, img_h, ox, oy, cw, ch, px, py, opt->gamma_correct);
 
-            /* Apply dither error to all subpixel samples (float, no premature rounding) */
-            if (opt->dither != DITHER_NONE) {
+            /* Apply dither: ordered uses Bayer threshold, others use error buffer */
+            if (opt->dither == DITHER_ORDERED) {
+                /* Bayer threshold: bias each sample by the matrix value.
+                 * Spread = palette step size (~85 for VGA). Scale to move
+                 * samples toward the nearest palette boundary. */
+                double threshold = BAYER4[cy & 3][cx & 3] * 64.0;
+                for (int py = 0; py < 16; py++)
+                    for (int px = 0; px < 8; px++) {
+                        samples[py][px].r = (uint8_t)clamp_byte((int)(samples[py][px].r + threshold));
+                        samples[py][px].g = (uint8_t)clamp_byte((int)(samples[py][px].g + threshold));
+                        samples[py][px].b = (uint8_t)clamp_byte((int)(samples[py][px].b + threshold));
+                    }
+            } else if (opt->dither != DITHER_NONE) {
                 FRGB ferr = err_get(cx, cy);
                 if (ferr.r != 0.0 || ferr.g != 0.0 || ferr.b != 0.0) {
                     for (int py = 0; py < 16; py++)
@@ -507,8 +614,8 @@ static Cell *convert_image(const uint8_t *img, int img_w, int img_h,
             Cell cell = best_cell(samples, pal, opt->ice, opt->metric);
             cells[cy * cols + cx] = cell;
 
-            /* Propagate dithering error */
-            if (opt->dither != DITHER_NONE) {
+            /* Propagate dithering error (error-diffusion modes only) */
+            if (opt->dither == DITHER_FS || opt->dither == DITHER_ATKINSON || opt->dither == DITHER_JJN) {
                 /* Compute the approximate RGB that this cell renders */
                 int fg = cell.attr & 0x0F;
                 int bg = (cell.attr >> 4) & 0x0F;
@@ -757,8 +864,11 @@ static void usage(const char *prog) {
         "  --rows N       height in rows (default: auto)\n"
         "  --palette vga  color palette: vga (default) or win\n"
         "  --ice          enable iCE colors (16 background colors)\n"
-        "  --dither MODE  dithering: none, fs (default), atkinson\n"
+        "  --dither MODE  dithering: none, fs (default), atkinson, ordered, jjn\n"
         "  --metric MODE  color metric: rm (default), rgb, ycbcr\n"
+        "  --gamma        gamma-correct resampling (linear light averaging)\n"
+        "  --no-gamma     disable gamma correction (default)\n"
+        "  --sharpen N    unsharp mask strength (default: off, try 0.5-2.0)\n"
         "  --sauce        embed SAUCE metadata record\n"
         "  --title STR    SAUCE title (implies --sauce)\n"
         "  --author STR   SAUCE author (implies --sauce)\n"
@@ -783,6 +893,8 @@ int main(int argc, char *argv[]) {
     opt.dither  = DITHER_FS;
     opt.metric  = METRIC_REDMEAN;
     opt.sauce   = 0;
+    opt.gamma_correct = 0;
+    opt.sharpen = 0.0;
 
     const char *in_file  = NULL;
     const char *out_file = NULL;
@@ -803,12 +915,21 @@ int main(int argc, char *argv[]) {
             else die("unknown palette (vga|win)");
         } else if (strcmp(argv[i], "--ice") == 0) {
             opt.ice = 1;
+        } else if (strcmp(argv[i], "--gamma") == 0) {
+            opt.gamma_correct = 1;
+        } else if (strcmp(argv[i], "--no-gamma") == 0) {
+            opt.gamma_correct = 0;
+        } else if (strcmp(argv[i], "--sharpen") == 0 && i+1 < argc) {
+            opt.sharpen = atof(argv[++i]);
+            if (opt.sharpen < 0.0) die("--sharpen must be >= 0");
         } else if (strcmp(argv[i], "--dither") == 0 && i+1 < argc) {
             i++;
             if (strcmp(argv[i], "none") == 0)         opt.dither = DITHER_NONE;
             else if (strcmp(argv[i], "fs") == 0)      opt.dither = DITHER_FS;
             else if (strcmp(argv[i], "atkinson") == 0) opt.dither = DITHER_ATKINSON;
-            else die("unknown dither mode (none|fs|atkinson)");
+            else if (strcmp(argv[i], "ordered") == 0) opt.dither = DITHER_ORDERED;
+            else if (strcmp(argv[i], "jjn") == 0)     opt.dither = DITHER_JJN;
+            else die("unknown dither mode (none|fs|atkinson|ordered|jjn)");
         } else if (strcmp(argv[i], "--metric") == 0 && i+1 < argc) {
             i++;
             if (strcmp(argv[i], "rgb") == 0)       opt.metric = METRIC_RGB;
@@ -864,10 +985,22 @@ int main(int argc, char *argv[]) {
 
     /* Init glyph cache */
     init_glyphs();
+    if (opt.gamma_correct)
+        init_gamma_tables();
+
+    /* Pre-process: sharpen if requested */
+    uint8_t *sharp_img = NULL;
+    if (opt.sharpen > 0.0) {
+        sharp_img = sharpen_image(img, img_w, img_h, opt.sharpen);
+        if (!sharp_img) die("out of memory (sharpen)");
+        fprintf(stderr, "img2ans: sharpened (amount=%.1f)\n", opt.sharpen);
+    }
 
     /* Convert */
     int out_cols, out_rows;
-    Cell *cells = convert_image(img, img_w, img_h, &opt, &out_cols, &out_rows);
+    const uint8_t *src = sharp_img ? sharp_img : img;
+    Cell *cells = convert_image(src, img_w, img_h, &opt, &out_cols, &out_rows);
+    free(sharp_img);
     stbi_image_free(img);
 
     fprintf(stderr, "img2ans: rendering %dx%d cells -> '%s'\n", out_cols, out_rows, out_file);
