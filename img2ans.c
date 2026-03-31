@@ -100,7 +100,7 @@ typedef enum { DITHER_NONE, DITHER_FS, DITHER_ATKINSON, DITHER_ORDERED, DITHER_J
 typedef enum { PAL_VGA, PAL_WIN } PaletteKind;
 typedef enum { GLYPH_STANDARD, GLYPH_EXTENDED } GlyphSet;
 typedef enum { COLOR_16, COLOR_256, COLOR_24BIT } ColorMode;
-typedef enum { FMT_ANS, FMT_BIN } OutputFormat;
+typedef enum { FMT_ANS, FMT_BIN, FMT_PHOTONBBS } OutputFormat;
 typedef enum { RESAMPLE_BOX, RESAMPLE_LANCZOS } ResampleMode;
 typedef enum { CHARSET_ANSI, CHARSET_PETSCII } CharSet;
 
@@ -1408,6 +1408,166 @@ static void save_ansi(FILE *f, const Cell *cells, int cols, int rows,
 }
 
 /* -------------------------------------------------------------------------
+ * PhotonBBS @code output writer
+ *
+ * Outputs ANSI art using PhotonBBS @code format:
+ *   @[color:NNN] - 256-color foreground (ESC[38;5;Nm equivalent)
+ *   @[bg:NNN]    - 256-color background (ESC[48;5;Nm equivalent)
+ *   @[RRGGBB]    - 24-bit foreground (ESC[38;2;R;G;Bm equivalent)
+ *   @[BG:RRGGBB] - 24-bit background (ESC[48;2;R;G;Bm equivalent)
+ *   @RST         - Reset all attributes (ESC[0m equivalent)
+ * ---------------------------------------------------------------------- */
+
+/* Track PhotonBBS @code state */
+typedef struct {
+    int fg_idx;   /* for 256-color mode: current fg palette index, -1 = unset */
+    int bg_idx;   /* for 256-color mode: current bg palette index, -1 = unset */
+    RGB fg_rgb;   /* for 24-bit mode: current fg color */
+    RGB bg_rgb;   /* for 24-bit mode: current bg color */
+    int first;    /* first cell of output flag */
+} PhotonState;
+
+/* Write PhotonBBS color code for 256-color foreground */
+static void photon_fg_256(FILE *f, int idx, PhotonState *s) {
+    if (s->fg_idx == idx) return;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "@[color:%d]", idx);
+    write_str(f, buf);
+    s->fg_idx = idx;
+}
+
+/* Write PhotonBBS color code for 256-color background */
+static void photon_bg_256(FILE *f, int idx, PhotonState *s) {
+    if (s->bg_idx == idx) return;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "@[bg:%d]", idx);
+    write_str(f, buf);
+    s->bg_idx = idx;
+}
+
+/* Write PhotonBBS color code for 24-bit foreground */
+static void photon_fg_24(FILE *f, RGB c, PhotonState *s) {
+    if (s->fg_rgb.r == c.r && s->fg_rgb.g == c.g && s->fg_rgb.b == c.b) return;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "@[%02X%02X%02X]", c.r, c.g, c.b);
+    write_str(f, buf);
+    s->fg_rgb = c;
+}
+
+/* Write PhotonBBS color code for 24-bit background */
+static void photon_bg_24(FILE *f, RGB c, PhotonState *s) {
+    if (s->bg_rgb.r == c.r && s->bg_rgb.g == c.g && s->bg_rgb.b == c.b) return;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "@[BG:%02X%02X%02X]", c.r, c.g, c.b);
+    write_str(f, buf);
+    s->bg_rgb = c;
+}
+
+/* Write PhotonBBS reset */
+static void photon_reset(FILE *f, PhotonState *s) {
+    write_str(f, "@RST");
+    s->fg_idx = -1;
+    s->bg_idx = -1;
+    s->fg_rgb.r = s->fg_rgb.g = s->fg_rgb.b = 0;
+    s->bg_rgb.r = s->bg_rgb.g = s->bg_rgb.b = 0;
+}
+
+static void save_photonbbs(FILE *f, const Cell *cells, int cols, int rows,
+                            const Options *opt) {
+    PhotonState s = { .fg_idx = -1, .bg_idx = -1, .first = 1 };
+
+    /* Initial reset */
+    photon_reset(f, &s);
+
+    if (opt->color_mode == COLOR_24BIT) {
+        /* 24-bit truecolor output */
+        for (int r = 0; r < rows; r++) {
+            for (int c = 0; c < cols; c++) {
+                const Cell *cell = &cells[r * cols + c];
+                uint8_t ch = cell->ch;
+                if (ch < 32 || ch == 127) ch = 32;
+
+                RGB fg = cell->fg_rgb, bg = cell->bg_rgb;
+
+                photon_fg_24(f, fg, &s);
+                photon_bg_24(f, bg, &s);
+                s.first = 0;
+                write_bytes(f, &ch, 1);
+            }
+            if (r < rows - 1) {
+                photon_reset(f, &s);
+                write_str(f, "\r\n");
+            }
+        }
+        photon_reset(f, &s);
+        return;
+    }
+
+    if (opt->color_mode == COLOR_256) {
+        /* 256-color output */
+        for (int r = 0; r < rows; r++) {
+            for (int c = 0; c < cols; c++) {
+                const Cell *cell = &cells[r * cols + c];
+                uint8_t ch = cell->ch;
+                if (ch < 32 || ch == 127) ch = 32;
+
+                photon_fg_256(f, cell->fg_idx, &s);
+                photon_bg_256(f, cell->bg_idx, &s);
+                s.first = 0;
+                write_bytes(f, &ch, 1);
+            }
+            if (r < rows - 1) {
+                photon_reset(f, &s);
+                write_str(f, "\r\n");
+            }
+        }
+        photon_reset(f, &s);
+        return;
+    }
+
+    /* 16-color mode: use 256-color indices for theme compatibility.
+     * VGA palette indices map to xterm-256 indices directly for colors 0-15. */
+    for (int r = 0; r < rows; r++) {
+        /* Trim trailing default-colored spaces from each row */
+        int last_col = -1;
+        for (int c = cols - 1; c >= 0; c--) {
+            const Cell *cell = &cells[r * cols + c];
+            uint8_t ch = cell->ch;
+            if (ch < 32 || ch == 127) ch = 32;
+            int fg_raw = cell->attr & 0x0F;
+            int bg_raw = (cell->attr >> 4) & 0x0F;
+            if (ch != 32 || fg_raw != 7 || bg_raw != 0) {
+                last_col = c;
+                break;
+            }
+        }
+
+        for (int c = 0; c <= last_col; c++) {
+            const Cell *cell = &cells[r * cols + c];
+            uint8_t ch = cell->ch;
+            if (ch < 32 || ch == 127) ch = 32;
+
+            int attr = cell->attr;
+            int fg_raw = attr & 0x0F;
+            int bg_raw = (attr >> 4) & 0x0F;
+
+            /* Emit colors using 256-color indices (VGA palette = xterm-256 0-15) */
+            photon_fg_256(f, fg_raw, &s);
+            photon_bg_256(f, bg_raw, &s);
+            s.first = 0;
+            write_bytes(f, &ch, 1);
+        }
+
+        if (r < rows - 1) {
+            photon_reset(f, &s);
+            write_str(f, "\r\n");
+        }
+    }
+
+    photon_reset(f, &s);
+}
+
+/* -------------------------------------------------------------------------
  * SAUCE record writer
  * Reference: https://www.acid.org/info/sauce/sauce.htm
  * ---------------------------------------------------------------------- */
@@ -1601,7 +1761,7 @@ static void usage(const char *prog) {
         "  --sharpen N    unsharp mask strength (default: off, try 0.5-2.0)\n"
         "  --glyphs SET   glyph set: standard (default) or extended\n"
         "  --colors MODE  color mode: 16 (default), 256, or 24bit\n"
-        "  --format FMT   output format: ans (default) or bin\n"
+        "  --format FMT   output format: ans (default), bin, or photonbbs\n"
         "  --resample M   resampling: box (default) or lanczos\n"
         "  --charset C    character set: ansi (default) or petscii\n"
         "  --sauce        embed SAUCE metadata record\n"
@@ -1670,9 +1830,10 @@ int main(int argc, char *argv[]) {
             else die("unknown color mode (16|256|24bit)");
         } else if (strcmp(argv[i], "--format") == 0 && i+1 < argc) {
             i++;
-            if (strcmp(argv[i], "ans") == 0)       opt.format = FMT_ANS;
-            else if (strcmp(argv[i], "bin") == 0)  opt.format = FMT_BIN;
-            else die("unknown format (ans|bin)");
+            if (strcmp(argv[i], "ans") == 0)          opt.format = FMT_ANS;
+            else if (strcmp(argv[i], "bin") == 0)     opt.format = FMT_BIN;
+            else if (strcmp(argv[i], "photonbbs") == 0) opt.format = FMT_PHOTONBBS;
+            else die("unknown format (ans|bin|photonbbs)");
         } else if (strcmp(argv[i], "--resample") == 0 && i+1 < argc) {
             i++;
             if (strcmp(argv[i], "box") == 0)        opt.resample = RESAMPLE_BOX;
@@ -1726,6 +1887,7 @@ int main(int argc, char *argv[]) {
     /* Build default output name: replace/append extension */
     static char out_buf[4096];
     const char *ext = (opt.format == FMT_BIN) ? ".bin" :
+                      (opt.format == FMT_PHOTONBBS) ? ".pbb" :
                       (opt.charset == CHARSET_PETSCII) ? ".pet" : ".ans";
     if (!out_file) {
         strncpy(out_buf, in_file, sizeof(out_buf) - 5);
@@ -1785,6 +1947,8 @@ int main(int argc, char *argv[]) {
 
     if (opt.format == FMT_BIN) {
         save_bin(f, cells, out_cols, out_rows);
+    } else if (opt.format == FMT_PHOTONBBS) {
+        save_photonbbs(f, cells, out_cols, out_rows, &opt);
     } else if (opt.charset == CHARSET_PETSCII) {
         save_petscii(f, cells, out_cols, out_rows);
     } else {

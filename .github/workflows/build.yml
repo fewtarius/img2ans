@@ -68,3 +68,38 @@ jobs:
           assert rows == 5,  f'expected rows=5 got {rows}'
           print(f'SAUCE OK: {cols}x{rows}')
           "
+
+      - name: PhotonBBS format test
+        run: |
+          # Test PhotonBBS format with all color modes
+          echo "=== Testing PhotonBBS format ==="
+          ./build/img2ans --format photonbbs --cols 20 --rows 10 --colors 256 /tmp/test_ci.png /tmp/pbb_256.ans
+          test -f /tmp/pbb_256.ans
+          echo "256-color: $(wc -c < /tmp/pbb_256.ans) bytes"
+          # Verify @codes are present
+          python3 -c "
+          content = open('/tmp/pbb_256.ans','rb').read()
+          assert b'@[color:' in content, 'Missing @[color:N] codes'
+          assert b'@[bg:' in content, 'Missing @[bg:N] codes'
+          assert b'@RST' in content, 'Missing @RST'
+          print('256-color PhotonBBS format: OK')
+          "
+          ./build/img2ans --format photonbbs --cols 20 --rows 10 --colors 24bit /tmp/test_ci.png /tmp/pbb_24.ans
+          python3 -c "
+          content = open('/tmp/pbb_24.ans','rb').read()
+          assert b'@[0' in content or b'@[' in content, 'Missing @[RRGGBB] codes'
+          assert b'@[BG:' in content, 'Missing @[BG:RRGGBB] codes'
+          assert b'@RST' in content, 'Missing @RST'
+          print('24-bit PhotonBBS format: OK')
+          "
+          ./build/img2ans --format photonbbs --cols 20 --rows 10 --colors 16 /tmp/test_ci.png /tmp/pbb_16.ans
+          python3 -c "
+          content = open('/tmp/pbb_16.ans','rb').read()
+          assert b'@[color:' in content, 'Missing @[color:N] codes'
+          assert b'@RST' in content, 'Missing @RST'
+          print('16-color PhotonBBS format: OK')
+          "
+          # Test default extension
+          ./build/img2ans --format photonbbs /tmp/test_ci.png
+          test -f /tmp/test_ci.pbb
+          echo "Default extension .pbb: OK"
